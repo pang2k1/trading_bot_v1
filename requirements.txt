@@ -1,0 +1,11 @@
+pandas
+ccxt
+yfinance
+numpy
+tabulate
+python-dotenv
+optuna
+feedparser
+vaderSentiment
+fastapi
+uvicorn[standard]
