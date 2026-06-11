@@ -4,12 +4,12 @@ Event-driven backtesting engine.
 Supports long and short positions (when config.LONG_ONLY is False),
 stop-loss, slippage, and fixed-fractional sizing.
 
-Signal conventions
-------------------
- 1  = open long
--1  = close long
--2  = open short
- 2  = close short
+Signal columns (booleans from strategy.py)
+-------------------------------------------
+long_entry  = open long
+long_exit   = close long
+short_entry = open short
+short_exit  = close short
 """
 
 import numpy as np
@@ -23,54 +23,73 @@ def run(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     position = None
     trades   = []
 
-    for ts, row in df.iterrows():
-        price  = float(row["close"])
-        signal = int(row["signal"])
+    # Extract arrays for fast iteration (avoid iterrows overhead)
+    closes      = df["close"].values.astype(float)
+    lows        = df["low"].values.astype(float)
+    highs       = df["high"].values.astype(float)
+    long_entry  = df["long_entry"].values.astype(bool)
+    long_exit   = df["long_exit"].values.astype(bool)
+    short_entry = df["short_entry"].values.astype(bool)
+    short_exit  = df["short_exit"].values.astype(bool)
+    timestamps  = df.index
+    long_only   = config.LONG_ONLY
+    slippage    = config.SLIPPAGE_PCT
+
+    for i in range(len(closes)):
+        price    = closes[i]
+        bar_low  = lows[i]
+        bar_high = highs[i]
+        ts       = timestamps[i]
 
         # ── Check stop-loss / exit on open position ────────────────────────
         if position is not None:
             side     = position["side"]
             stop_hit = (
-                (side == "long"  and price <= position["stop_loss"]) or
-                (side == "short" and price >= position["stop_loss"])
+                (side == "long"  and bar_low <= position["stop_loss"]) or
+                (side == "short" and bar_high >= position["stop_loss"])
             )
             exit_signal = (
-                (side == "long"  and signal == -1) or
-                (side == "short" and signal ==  2)
+                (side == "long"  and long_exit[i]) or
+                (side == "short" and short_exit[i])
             )
 
-            if stop_hit or exit_signal:
-                exit_px = position["stop_loss"] if stop_hit else price
-                # Apply slippage on exit (adverse direction)
+            if stop_hit:
+                exit_px = position["stop_loss"]
                 if side == "long":
-                    exit_px *= (1 - config.SLIPPAGE_PCT)
+                    exit_px *= (1 - slippage)
                 else:
-                    exit_px *= (1 + config.SLIPPAGE_PCT)
-                pnl, equity = _close(position, exit_px, equity)
-                trades.append(_record(position, exit_px, ts, pnl,
-                                      "stop-loss" if stop_hit else ""))
+                    exit_px *= (1 + slippage)
+                pnl, equity = _close(position, exit_px, equity, exit_ts=ts)
+                trades.append(_record(position, exit_px, ts, pnl, "stop-loss"))
+                position = None
+            elif exit_signal:
+                exit_px = price
+                if side == "long":
+                    exit_px *= (1 - slippage)
+                else:
+                    exit_px *= (1 + slippage)
+                pnl, equity = _close(position, exit_px, equity, exit_ts=ts)
+                trades.append(_record(position, exit_px, ts, pnl, ""))
                 position = None
 
         # ── Open new position ──────────────────────────────────────────────
         if position is None:
-            if signal == 1:
-                # Apply slippage on entry (adverse direction for long)
-                fill_px = price * (1 + config.SLIPPAGE_PCT)
+            if long_entry[i]:
+                fill_px = price * (1 + slippage)
                 position, equity = _open("long", fill_px, ts, equity)
-            elif signal == -2 and not config.LONG_ONLY:
-                # Apply slippage on entry (adverse direction for short)
-                fill_px = price * (1 - config.SLIPPAGE_PCT)
+            elif short_entry[i] and not long_only:
+                fill_px = price * (1 - slippage)
                 position, equity = _open("short", fill_px, ts, equity)
 
     # ── Force-close at last bar ────────────────────────────────────────────
     if position is not None:
-        last_px = float(df["close"].iloc[-1])
+        last_px = closes[-1]
         if position["side"] == "long":
-            last_px *= (1 - config.SLIPPAGE_PCT)
+            last_px *= (1 - slippage)
         else:
-            last_px *= (1 + config.SLIPPAGE_PCT)
-        pnl, equity = _close(position, last_px, equity)
-        trades.append(_record(position, last_px, df.index[-1], pnl, "forced close"))
+            last_px *= (1 + slippage)
+        pnl, equity = _close(position, last_px, equity, exit_ts=timestamps[-1])
+        trades.append(_record(position, last_px, timestamps[-1], pnl, "forced close"))
 
     trades_df = pd.DataFrame(trades)
     return _metrics(trades_df, equity), trades_df
@@ -78,8 +97,11 @@ def run(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
 
 # ── Position helpers ──────────────────────────────────────────────────────────
 
+_MIN_NOTIONAL = 5.5  # Binance minimum — keep in sync with live_trader
+
+
 def _open(side: str, price: float, ts, equity: float):
-    notional = equity * config.RISK_PER_TRADE
+    notional = max(equity * config.RISK_PER_TRADE, _MIN_NOTIONAL)
     qty      = notional / price
     comm     = notional * config.COMMISSION
 
@@ -88,7 +110,7 @@ def _open(side: str, price: float, ts, equity: float):
         equity   -= notional + comm
     else:
         stop_loss = price * (1 + config.STOP_LOSS_PCT)
-        equity   -= comm   # short: no cash locked, just commission upfront
+        equity   -= comm
 
     return {
         "side"        : side,
@@ -101,7 +123,7 @@ def _open(side: str, price: float, ts, equity: float):
     }, equity
 
 
-def _close(pos: dict, exit_price: float, equity: float):
+def _close(pos: dict, exit_price: float, equity: float, exit_ts=None):
     qty      = pos["qty"]
     exit_comm = qty * exit_price * config.COMMISSION
 
@@ -110,8 +132,13 @@ def _close(pos: dict, exit_price: float, equity: float):
         pnl      = proceeds - pos["notional"] - pos["entry_comm"]
         equity  += pos["notional"] + pos["entry_comm"] + pnl
     else:
-        pnl      = (pos["entry_price"] - exit_price) * qty - exit_comm - pos["entry_comm"]
-        equity  += pos["notional"] + pnl
+        pnl = (pos["entry_price"] - exit_price) * qty - exit_comm - pos["entry_comm"]
+        # Deduct margin borrow cost for shorts
+        if exit_ts is not None and hasattr(pos["entry_time"], "timestamp"):
+            hours_held = (exit_ts.timestamp() - pos["entry_time"].timestamp()) / 3600
+            borrow_cost = pos["notional"] * config.MARGIN_INTEREST_HOURLY * max(hours_held, 0)
+            pnl -= borrow_cost
+        equity += pnl + pos["entry_comm"]
 
     return pnl, equity
 
@@ -166,7 +193,6 @@ def _metrics(trades: pd.DataFrame, final_equity: float) -> dict:
 
     gross_profit = wins["pnl_usd"].sum()
     gross_loss   = abs(losses["pnl_usd"].sum())
-    # Cap profit_factor at 99.0 instead of infinity so JSON serialisation never breaks
     if gross_loss > 0:
         profit_factor = min(gross_profit / gross_loss, 99.0)
     elif gross_profit > 0:
@@ -174,11 +200,22 @@ def _metrics(trades: pd.DataFrame, final_equity: float) -> dict:
     else:
         profit_factor = 0.0
 
-    cum      = trades["pnl_usd"].cumsum()
-    max_dd   = (cum - cum.cummax()).min() / initial * 100
+    # Max drawdown from running equity curve
+    equity_curve = initial + trades["pnl_usd"].cumsum()
+    running_peak = equity_curve.cummax()
+    drawdowns = (equity_curve - running_peak) / running_peak * 100
+    max_dd = drawdowns.min()
 
-    pct_std = trades["pnl_pct"].std()
-    sharpe  = (trades["pnl_pct"].mean() / pct_std * np.sqrt(252)) if pct_std > 0 else 0.0
+    # Sharpe: annualize daily returns with sqrt(365) for crypto (7-day markets)
+    if "exit_time" in trades.columns and len(trades) > 1:
+        daily_pnl = trades.set_index("exit_time")["pnl_usd"].resample("1D").sum()
+        daily_ret = daily_pnl / initial
+        if daily_ret.std() > 0:
+            sharpe = daily_ret.mean() / daily_ret.std() * np.sqrt(365)
+        else:
+            sharpe = 0.0
+    else:
+        sharpe = 0.0
 
     stop_hits = int(trades.get("note", pd.Series(dtype=str))
                     .str.contains("stop", na=False).sum()) \

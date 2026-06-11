@@ -34,7 +34,7 @@ EMA_TREND2 = 21    # applied to TREND_TF2 (4h EMA-21)
 # RISK_PER_TRADE = fraction of balance used as trade notional (position size).
 #   Binance minimum order is ~5 USDT, so this must stay high enough for small accounts.
 #   At 20% of $28 = ~$5.60 notional — above the $5 minimum.
-#   Stop-loss at 1.5% means max loss per trade ≈ $0.08 + fees (0.3% of account).
+#   Stop-loss at 1.2% means max loss per trade ≈ $0.07 + fees (0.3% of account).
 INITIAL_CAPITAL = 28          # USDT equivalent of 1000 THB
 RISK_PER_TRADE  = 0.20        # 20% of balance per trade (small account — must meet Binance $5 minimum)
 STOP_LOSS_PCT   = 0.012       # 1.2% stop-loss (widened for real-time intra-candle checks)
@@ -63,6 +63,19 @@ LONG_ONLY = False
 # depending on the asset. There is no programmatic leverage setter — borrow ratio
 # is controlled by how large a position you open relative to your free balance.
 MARGIN_TYPE = "cross"  # cross-margin: simpler setup, whole balance as collateral
+
+# ── Short borrow cost ──────────────────────────────────────────────────────────
+# Hourly interest rate for margin borrowing (Binance cross-margin BTC ≈ 0.0009%/h).
+# Deducted from short PnL in backtesting. Verify current rate on Binance margin page.
+MARGIN_INTEREST_HOURLY = 0.000009  # 0.0009% per hour
+
+# ── Backtest scope ─────────────────────────────────────────────────────────────
+# Backtest covers TECHNICAL SIGNALS ONLY (BB, RSI, multi-TF trend bias).
+# The live trader's news/sentiment layer (news_analyzer.py → _decide_action)
+# is NOT simulated in backtesting. Live performance may differ when news
+# triggers entries that the backtest would not produce (or skips entries
+# the backtest would take).
+BACKTEST_COVERS_NEWS = False  # set True if news scores are wired into backtest.run()
 
 # ── Exchange ──────────────────────────────────────────────────────────────────
 EXCHANGE = "binance"

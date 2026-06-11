@@ -58,8 +58,12 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 def _bot_pid() -> int | None:
+    """Find the PID of the live trader process using exact match to avoid false positives."""
     try:
-        out = subprocess.check_output(["pgrep", "-f", "live_trader.py"], text=True).strip()
+        out = subprocess.check_output(
+            ["pgrep", "-f", r"python.*live_trader\.py"],
+            text=True,
+        ).strip()
         pids = [int(p) for p in out.splitlines() if p.strip()]
         return pids[0] if pids else None
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -159,19 +163,30 @@ def get_trades(_: str = Depends(authenticate)):
 
 
 @app.post("/api/bot/start")
-def bot_start(_: str = Depends(authenticate)):
+def bot_start(request: Request, _: str = Depends(authenticate)):
+    """Start the bot. Defaults to testnet. Requires explicit mode=live for real money."""
     if _bot_pid():
         return {"ok": False, "reason": "already running"}
     python = BOT_DIR / "venv" / "bin" / "python"
     if not python.exists():
         python = Path(sys.executable)
+
+    # Default to testnet for safety
+    args = [str(python), "live_trader.py"]
+
+    # Check if live mode is explicitly requested via query param
+    import asyncio
+    mode = request.query_params.get("mode", "testnet")
+    if mode == "live":
+        args.append("--live")
+
     subprocess.Popen(
-        [str(python), "live_trader.py", "--live"],
+        args,
         cwd=str(BOT_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return {"ok": True}
+    return {"ok": True, "mode": mode}
 
 
 @app.post("/api/bot/stop")
@@ -477,11 +492,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Bind address (default: 127.0.0.1 — localhost only)")
     args = parser.parse_args()
     load_dotenv()
     if not os.getenv("WEB_UI_PASSWORD") or os.getenv("WEB_UI_PASSWORD") == "changeme":
         print("ERROR: WEB_UI_PASSWORD is not set or is still 'changeme'.")
         print("Set a strong password in .env before starting the dashboard.")
         sys.exit(1)
-    print(f"Dashboard → http://0.0.0.0:{args.port}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+    print(f"Dashboard → http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

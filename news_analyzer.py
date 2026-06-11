@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import feedparser
+import requests
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 NEWS_REPORT_FILE = Path("news_report.json")
@@ -60,9 +61,12 @@ GENERAL_KEYWORDS = ["crypto", "cryptocurrency", "digital asset", "blockchain", "
 # ── Fetching ──────────────────────────────────────────────────────────────────
 
 def _fetch_feed(feed: dict, max_age_hours: int = 24) -> list[dict]:
-    """Fetch and parse a single RSS feed. Returns articles from last max_age_hours."""
+    """Fetch and parse a single RSS feed. Returns articles from last max_age_hours.
+    Uses requests with a timeout to avoid blocking the trading loop."""
     try:
-        parsed   = feedparser.parse(feed["url"])
+        response = requests.get(feed["url"], timeout=10)
+        response.raise_for_status()
+        parsed   = feedparser.parse(response.content)
         cutoff   = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         articles = []
 

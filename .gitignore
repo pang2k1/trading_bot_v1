@@ -188,5 +188,9 @@ optimization_results.json
 best_params.json
 news_report.json
 
+# OHLCV cache (data_fetcher parquet cache)
+data/
+*.parquet
+
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json

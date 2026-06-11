@@ -66,14 +66,20 @@ def build(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     -------
     A single DataFrame at BASE_TF resolution with all indicator columns.
     NaN rows (warm-up period and any zero-loss RSI bars) are dropped.
+
+    Look-ahead prevention: higher-TF trend columns are shifted by 1 bar on
+    their own timeframe before joining, so 15m bars inside a candle only
+    see the PREVIOUS closed candle's bias — matching live behaviour.
     """
     base  = _add_base_indicators(frames[config.BASE_TF])
     tf1   = _add_trend_indicators(frames[config.TREND_TF1], config.EMA_TREND1, "trend1")
     tf2   = _add_trend_indicators(frames[config.TREND_TF2], config.EMA_TREND2, "trend2")
 
-    # Merge trend columns into base using forward-fill (last known higher-TF value)
+    # Shift trend columns by 1 bar on their own timeframe to prevent look-ahead
     trend_cols1 = ["trend1_ema", "trend1_bias"]
     trend_cols2 = ["trend2_ema", "trend2_bias"]
+    tf1[trend_cols1] = tf1[trend_cols1].shift(1)
+    tf2[trend_cols2] = tf2[trend_cols2].shift(1)
 
     merged = base.join(tf1[trend_cols1], how="left").join(tf2[trend_cols2], how="left")
     merged[trend_cols1 + trend_cols2] = merged[trend_cols1 + trend_cols2].ffill()

@@ -115,7 +115,6 @@ def _objective(trial: optuna.Trial, frames: dict) -> float:
         "EMA_TREND1":      trial.suggest_int(  "EMA_TREND1",       10,   50),
         "EMA_TREND2":      trial.suggest_int(  "EMA_TREND2",       30,  150),
         "STOP_LOSS_PCT":   trial.suggest_float("STOP_LOSS_PCT",   0.005, 0.04),
-        "RISK_PER_TRADE":  trial.suggest_float("RISK_PER_TRADE",  0.01,  0.05),
     }
 
     # Enforce logical constraints — prune invalid combos early
@@ -131,10 +130,11 @@ def _objective(trial: optuna.Trial, frames: dict) -> float:
     if metrics["num_trades"] < 10:
         raise optuna.exceptions.TrialPruned()
 
-    # Multi-objective score: reward Sharpe, penalise deep drawdown
+    # Report intermediate score so the pruner can actually prune
     sharpe   = metrics["sharpe_ratio"]
     drawdown = abs(metrics["max_drawdown_pct"])
     score    = sharpe - 0.3 * (drawdown / 10)
+    trial.report(score, step=0)
 
     return score
 
@@ -151,9 +151,24 @@ def _fetch_data(symbol: str, lookback_days: int = 180) -> dict:
 
 # ── Optimization run ──────────────────────────────────────────────────────────
 
+def _split_frames(frames: dict, train_ratio: float = 0.7) -> tuple[dict, dict]:
+    """Split frames into train/test by time index."""
+    split_point = int(len(frames[config.BASE_TF]) * train_ratio)
+    cutoff = frames[config.BASE_TF].index[split_point]
+
+    train_frames = {}
+    test_frames = {}
+    for tf, df in frames.items():
+        train_frames[tf] = df.loc[:cutoff]
+        test_frames[tf] = df.loc[cutoff:]
+    return train_frames, test_frames
+
+
 def optimize(symbol: str = "BTC/USDT", n_trials: int = 100) -> dict:
     """
-    Run Optuna optimization. Returns the best params dict.
+    Run Optuna optimization with walk-forward validation.
+    Optimizes on 70% train split, validates on 30% test split.
+    Returns the best params dict.
     """
     print(f"\n{'='*60}")
     print(f"  Optimizer  —  {symbol}  —  {n_trials} trials")
@@ -166,6 +181,12 @@ def optimize(symbol: str = "BTC/USDT", n_trials: int = 100) -> dict:
         f"  {config.BASE_TF}: {len(base_df)} bars  "
         f"({base_df.index[0].date()} → {base_df.index[-1].date()})"
     )
+
+    # Walk-forward split: 70% train / 30% test
+    train_frames, test_frames = _split_frames(frames, train_ratio=0.7)
+    train_len = len(train_frames[config.BASE_TF])
+    test_len = len(test_frames[config.BASE_TF])
+    print(f"  Walk-forward split: train={train_len} bars, test={test_len} bars")
 
     # Baseline: run backtest with current (default) config params
     baseline = _run_backtest(frames, {})
@@ -180,23 +201,43 @@ def optimize(symbol: str = "BTC/USDT", n_trials: int = 100) -> dict:
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=15, n_warmup_steps=5),
     )
 
     study.optimize(
-        lambda trial: _objective(trial, frames),
+        lambda trial: _objective(trial, train_frames),
         n_trials=n_trials,
         show_progress_bar=True,
     )
 
+    # Check if any trial completed successfully
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        print("\nAll trials were pruned — no valid parameter set found.")
+        print("Try relaxing constraints or increasing the data range.")
+        return {}
+
     best_params = study.best_params
     best_score  = study.best_value
-    best_metrics = _run_backtest(frames, best_params)
 
-    # Print comparison
+    # Evaluate on both train and test splits
+    train_metrics = _run_backtest(train_frames, best_params)
+    test_metrics  = _run_backtest(test_frames, best_params)
+    full_metrics  = _run_backtest(frames, best_params)
+
     print(f"\n{'='*60}")
-    print(f"  Optimization complete  —  best score: {best_score:.4f}")
+    print(f"  Optimization complete  —  best train score: {best_score:.4f}")
     print(f"{'='*60}")
+
+    # Overfitting check
+    train_score = train_metrics["sharpe_ratio"]
+    test_score  = test_metrics["sharpe_ratio"]
+    if train_score > 0 and test_score < train_score * 0.3:
+        print(
+            f"\n  ⚠ WARNING: Test Sharpe ({test_score:.2f}) is much worse than "
+            f"train ({train_score:.2f}) — possible overfitting."
+        )
+    print(f"\n  Train Sharpe: {train_score:.2f}  |  Test Sharpe: {test_score:.2f}")
+
     print("\nParameter comparison:")
     rows = []
     for k, v in best_params.items():
@@ -214,12 +255,12 @@ def optimize(symbol: str = "BTC/USDT", n_trials: int = 100) -> dict:
         rows.append([
             k.replace("_", " ").title(),
             f"{baseline[k]:.2f}",
-            f"{best_metrics[k]:.2f}",
+            f"{full_metrics[k]:.2f}",
         ])
     print(tabulate(rows, headers=["Metric", "Baseline", "Optimized"], tablefmt="simple"))
 
     # Save results history
-    _save_results(symbol, best_params, best_metrics, best_score)
+    _save_results(symbol, best_params, full_metrics, best_score)
 
     return best_params
 

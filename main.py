@@ -32,9 +32,9 @@ def run_symbol(symbol: str) -> dict | None:
 
     df = strategy.generate_signals(df)
 
-    n_long  = (df["signal"] ==  1).sum()
-    n_short = (df["signal"] == -2).sum()
-    print(f"    Signals generated -> LONG: {n_long}  SHORT: {n_short}")
+    n_long_entry  = df["long_entry"].sum()
+    n_short_entry = df["short_entry"].sum()
+    print(f"    Signals generated -> LONG: {n_long_entry}  SHORT: {n_short_entry}")
 
     metrics, trades = backtest.run(df)
 

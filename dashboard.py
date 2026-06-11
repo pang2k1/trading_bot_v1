@@ -10,6 +10,7 @@ Usage
 
 import os
 import tempfile
+import webbrowser
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -286,13 +287,13 @@ HTML = r"""<!DOCTYPE html>
     <div class="stage-box" style="border-color:var(--c-strat); background:#0d1a0d;">
       <div class="module">strategy.py</div>
       <div class="fn">generate_signals()</div>
-      <div class="desc">Adds signal column: 1 long, -1 close long, -2 short, 2 close short.</div>
+      <div class="desc">Adds boolean columns: long_entry, long_exit, short_entry, short_exit.</div>
     </div>
   </div>
 
   <div class="arrow-wrap">
     <div class="arrow"><span>&#8594;</span></div>
-    <div class="data-label">DataFrame<br>+ signal col</div>
+    <div class="data-label">DataFrame<br>+ signal bools</div>
   </div>
 
   <!-- backtest -->
@@ -334,7 +335,7 @@ HTML = r"""<!DOCTYPE html>
     <ul class="fn-list">
       <li>
         <span class="fn-sig">CRYPTO_SYMBOLS</span>
-        <span class="fn-desc">List of trading pairs to backtest. Default: ["BTC/USDT", "ETH/USDT"]</span>
+        <span class="fn-desc">List of trading pairs to backtest. Current: {CONFIG_SYMBOLS}</span>
       </li>
       <li>
         <span class="fn-sig">BASE_TF / TREND_TF1 / TREND_TF2</span>
@@ -342,19 +343,19 @@ HTML = r"""<!DOCTYPE html>
       </li>
       <li>
         <span class="fn-sig">BB_PERIOD, BB_STD</span>
-        <span class="fn-desc">Bollinger Band window (20) and standard deviation multiplier (2.0)</span>
+        <span class="fn-desc">Bollinger Band window ({CONFIG_BB_PERIOD}) and standard deviation multiplier ({CONFIG_BB_STD})</span>
       </li>
       <li>
         <span class="fn-sig">RSI_PERIOD, RSI_LONG/SHORT_ENTRY/EXIT</span>
-        <span class="fn-desc">RSI(14) thresholds: entry long &lt;38, entry short &gt;62, exit long &gt;58, exit short &lt;42</span>
+        <span class="fn-desc">RSI({CONFIG_RSI_PERIOD}) thresholds: entry long &lt;{CONFIG_RSI_LONG_ENTRY}, entry short &gt;{CONFIG_RSI_SHORT_ENTRY}, exit long &gt;{CONFIG_RSI_LONG_EXIT}, exit short &lt;{CONFIG_RSI_SHORT_EXIT}</span>
       </li>
       <li>
         <span class="fn-sig">EMA_TREND1 / EMA_TREND2</span>
-        <span class="fn-desc">EMA periods: 20 on 1h bars, 50 on 4h bars</span>
+        <span class="fn-desc">EMA periods: {CONFIG_EMA_TREND1} on 1h bars, {CONFIG_EMA_TREND2} on 4h bars</span>
       </li>
       <li>
         <span class="fn-sig">INITIAL_CAPITAL, RISK_PER_TRADE, STOP_LOSS_PCT, COMMISSION</span>
-        <span class="fn-desc">$10 000 starting capital · 2% risk/trade · 1.5% stop-loss · 0.1% commission/side</span>
+        <span class="fn-desc">{CONFIG_INITIAL_CAPITAL} starting capital · {CONFIG_RISK_PER_TRADE} risk/trade · {CONFIG_STOP_LOSS_PCT} stop-loss · {CONFIG_COMMISSION} commission/side</span>
       </li>
     </ul>
   </div>
@@ -439,14 +440,9 @@ HTML = r"""<!DOCTYPE html>
     <ul class="fn-list">
       <li>
         <span class="fn-sig">generate_signals(df)</span>
-        <span class="fn-desc">Evaluates entry/exit conditions on each bar and writes to a "signal" column.
-          <br><br>
-          <b>LONG entry (1):</b> close ≤ bb_lower AND rsi &lt; 38 AND both trend biases bullish<br>
-          <b>LONG exit (-1):</b> close ≥ bb_mid OR rsi &gt; 58 OR 1h trend turns bearish<br>
-          <b>SHORT entry (-2):</b> close ≥ bb_upper AND rsi &gt; 62 AND both trend biases bearish<br>
-          <b>SHORT exit (2):</b> close ≤ bb_mid OR rsi &lt; 42 OR 1h trend turns bullish
+        <span class="fn-desc">Evaluates entry/exit conditions on each bar and sets boolean columns: long_entry, long_exit, short_entry, short_exit.
         </span>
-        <span class="fn-returns">→ DataFrame (with signal column added)</span>
+        <span class="fn-returns">→ DataFrame (with boolean signal columns added)</span>
       </li>
     </ul>
   </div>
@@ -540,7 +536,7 @@ HTML = r"""<!DOCTYPE html>
        │    →  <span class="data">DataFrame (15m, all columns)</span>
        │
        ├─ <span class="module">strategy</span>.<span class="call">generate_signals(df)</span>
-       │    →  <span class="data">DataFrame + signal ∈ {-2, -1, 0, 1, 2}</span>
+       │    →  <span class="data">DataFrame + boolean signal columns</span>
        │
        └─ <span class="module">backtest</span>.<span class="call">run(df)</span>
             ├─ per-bar loop:
@@ -557,40 +553,40 @@ HTML = r"""<!DOCTYPE html>
   <h2>Signal Convention</h2>
   <div class="signal-grid">
     <div class="signal-card" style="background:#0d1a0d; border-color:#56d364;">
-      <div class="sig-val" style="color:#56d364;">+1</div>
+      <div class="sig-val" style="color:#56d364;">long_entry</div>
       <div class="sig-name">Open Long</div>
       <div class="sig-cond">
         close ≤ bb_lower<br>
-        RSI &lt; 38<br>
+        RSI &lt; {CONFIG_RSI_LONG_ENTRY}<br>
         trend1_bias = 1  (1h bullish)<br>
         trend2_bias = 1  (4h bullish)
       </div>
     </div>
     <div class="signal-card" style="background:#1a0d0d; border-color:#ff7b72;">
-      <div class="sig-val" style="color:#ff7b72;">−1</div>
+      <div class="sig-val" style="color:#ff7b72;">long_exit</div>
       <div class="sig-name">Close Long</div>
       <div class="sig-cond">
         close ≥ bb_mid  OR<br>
-        RSI &gt; 58  OR<br>
+        RSI &gt; {CONFIG_RSI_LONG_EXIT}  OR<br>
         trend1_bias turns −1
       </div>
     </div>
     <div class="signal-card" style="background:#1a0d0d; border-color:#f0883e;">
-      <div class="sig-val" style="color:#f0883e;">−2</div>
+      <div class="sig-val" style="color:#f0883e;">short_entry</div>
       <div class="sig-name">Open Short</div>
       <div class="sig-cond">
         close ≥ bb_upper<br>
-        RSI &gt; 62<br>
+        RSI &gt; {CONFIG_RSI_SHORT_ENTRY}<br>
         trend1_bias = −1  (1h bearish)<br>
         trend2_bias = −1  (4h bearish)
       </div>
     </div>
     <div class="signal-card" style="background:#0d1a0d; border-color:#56d364;">
-      <div class="sig-val" style="color:#56d364;">+2</div>
+      <div class="sig-val" style="color:#56d364;">short_exit</div>
       <div class="sig-name">Close Short</div>
       <div class="sig-cond">
         close ≤ bb_mid  OR<br>
-        RSI &lt; 42  OR<br>
+        RSI &lt; {CONFIG_RSI_SHORT_EXIT}  OR<br>
         trend1_bias turns +1
       </div>
     </div>
@@ -607,15 +603,38 @@ HTML = r"""<!DOCTYPE html>
 
 
 def main() -> None:
+    import config
+
+    html = HTML
+    # Interpolate actual config values into the HTML
+    replacements = {
+        "{CONFIG_SYMBOLS}": str(config.CRYPTO_SYMBOLS),
+        "{CONFIG_BB_PERIOD}": str(config.BB_PERIOD),
+        "{CONFIG_BB_STD}": str(config.BB_STD),
+        "{CONFIG_RSI_PERIOD}": str(config.RSI_PERIOD),
+        "{CONFIG_RSI_LONG_ENTRY}": str(config.RSI_LONG_ENTRY),
+        "{CONFIG_RSI_SHORT_ENTRY}": str(config.RSI_SHORT_ENTRY),
+        "{CONFIG_RSI_LONG_EXIT}": str(config.RSI_LONG_EXIT),
+        "{CONFIG_RSI_SHORT_EXIT}": str(config.RSI_SHORT_EXIT),
+        "{CONFIG_EMA_TREND1}": str(config.EMA_TREND1),
+        "{CONFIG_EMA_TREND2}": str(config.EMA_TREND2),
+        "{CONFIG_INITIAL_CAPITAL}": f"${config.INITIAL_CAPITAL:,}",
+        "{CONFIG_RISK_PER_TRADE}": f"{config.RISK_PER_TRADE*100:.0f}%",
+        "{CONFIG_STOP_LOSS_PCT}": f"{config.STOP_LOSS_PCT*100:.1f}%",
+        "{CONFIG_COMMISSION}": f"{config.COMMISSION*100:.1f}%",
+    }
+    for placeholder, value in replacements.items():
+        html = html.replace(placeholder, value)
+
     # Write to a temp file and open in browser
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".html", delete=False, encoding="utf-8"
     )
-    tmp.write(HTML)
+    tmp.write(html)
     tmp.close()
 
     print(f"Opening dashboard: {tmp.name}")
-    os.startfile(tmp.name)
+    webbrowser.open(f"file://{tmp.name}")
     print("Dashboard opened in your default browser.")
     print(f"(Temp file: {tmp.name})")
 

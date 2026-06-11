@@ -45,6 +45,7 @@ Notes
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -66,7 +67,9 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("live_trader.log", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            "live_trader.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"
+        ),
     ],
 )
 log = logging.getLogger(__name__)
@@ -212,7 +215,7 @@ def _save_state(state: dict) -> None:
 
 class DailyCircuitBreaker:
     """
-    Tracks realised PnL for the current UTC day.
+    Tracks realised + unrealised PnL for the current UTC day.
     Halts trading if total losses exceed config.MAX_DAILY_LOSS_PCT of the
     starting balance for that day. Resets automatically at UTC midnight.
     """
@@ -221,6 +224,7 @@ class DailyCircuitBreaker:
         self._date: str = ""
         self._start_balance: float = 0.0
         self._daily_pnl: float = 0.0
+        self._unrealized_pnl: float = 0.0
         self._halted: bool = False
 
     def reset_if_new_day(self, current_balance: float) -> None:
@@ -229,13 +233,26 @@ class DailyCircuitBreaker:
             self._date          = today
             self._start_balance = current_balance
             self._daily_pnl     = 0.0
+            self._unrealized_pnl = 0.0
             self._halted        = False
             log.info(f"[circuit] New day {today} — daily PnL reset. Start balance: {current_balance:.4f} USDT")
 
     def record_pnl(self, pnl: float) -> None:
         self._daily_pnl += pnl
-        loss_pct = -self._daily_pnl / self._start_balance if self._start_balance > 0 else 0
-        log.info(f"[circuit] Daily PnL: {self._daily_pnl:+.4f} USDT  ({-loss_pct*100:.2f}% of day start)")
+        self._check_halt()
+
+    def set_unrealized(self, unrealized_pnl: float) -> None:
+        self._unrealized_pnl = unrealized_pnl
+        self._check_halt()
+
+    def _check_halt(self) -> None:
+        total_pnl = self._daily_pnl + self._unrealized_pnl
+        loss_pct = -total_pnl / self._start_balance if self._start_balance > 0 else 0
+        log.info(
+            f"[circuit] PnL: realised={self._daily_pnl:+.4f}  "
+            f"unrealised={self._unrealized_pnl:+.4f}  "
+            f"total={total_pnl:+.4f} USDT  ({-loss_pct*100:.2f}% of day start)"
+        )
         if loss_pct >= config.MAX_DAILY_LOSS_PCT and not self._halted:
             self._halted = True
             log.warning(
@@ -269,10 +286,11 @@ def _fetch_recent_bars(
 
 # ── Signal computation ────────────────────────────────────────────────────────
 
-def _get_signal(exchange: ccxt.binance, symbol: str) -> tuple[int, float]:
+def _get_signal(exchange: ccxt.binance, symbol: str) -> tuple[dict, float]:
     """
     Fetch latest bars, compute indicators, generate signals.
-    Returns (signal_on_last_closed_bar, last_close_price).
+    Returns (signal_dict, last_close_price) where signal_dict has boolean keys:
+        long_entry, long_exit, short_entry, short_exit.
     """
     frames = {
         config.BASE_TF:   _fetch_recent_bars(exchange, symbol, config.BASE_TF),
@@ -282,7 +300,13 @@ def _get_signal(exchange: ccxt.binance, symbol: str) -> tuple[int, float]:
     df = indicators.build(frames)
     df = strategy.generate_signals(df)
     last = df.iloc[-1]
-    return int(last["signal"]), float(last["close"])
+    signals = {
+        "long_entry":  bool(last.get("long_entry", False)),
+        "long_exit":   bool(last.get("long_exit", False)),
+        "short_entry": bool(last.get("short_entry", False)),
+        "short_exit":  bool(last.get("short_exit", False)),
+    }
+    return signals, float(last["close"])
 
 
 # ── Order execution ───────────────────────────────────────────────────────────
@@ -298,11 +322,51 @@ def _get_usdt_balance(exchange: ccxt.binance) -> float:
 _MIN_NOTIONAL = 5.5  # Binance minimum is 5 USDT — keep a small buffer
 
 def _calc_qty(exchange: ccxt.binance, symbol: str, price: float) -> float:
-    """Size position: equity × RISK_PER_TRADE, min 5.5 USDT notional, rounded to exchange precision."""
-    notional = max(_get_usdt_balance(exchange) * config.RISK_PER_TRADE, _MIN_NOTIONAL)
+    """Size position: equity × RISK_PER_TRADE, min 5.5 USDT notional, rounded to exchange precision.
+    Returns 0 if free balance is below min notional."""
+    free_balance = _get_usdt_balance(exchange)
+    if free_balance < _MIN_NOTIONAL:
+        log.warning(f"[{symbol}] Free balance ({free_balance:.2f} USDT) below min notional ({_MIN_NOTIONAL}) — skipping.")
+        return 0
+    notional = max(free_balance * config.RISK_PER_TRADE, _MIN_NOTIONAL)
     qty      = notional / price
     qty      = float(exchange.amount_to_precision(symbol, qty))
     return qty
+
+
+def _place_exchange_stop(exchange: ccxt.binance, symbol: str, side: str, qty: float, stop_price: float) -> str | None:
+    """Place an exchange-side stop-loss-limit order. Returns order ID or None on failure."""
+    try:
+        if side == "long":
+            # Sell to close long: stop triggers a limit sell below stop
+            limit_price = round(stop_price * 0.995, 8)  # limit slightly below stop for fill
+            stop_order = exchange.create_order(
+                symbol, "stop_loss_limit", "sell", qty, limit_price,
+                params={"stopPrice": stop_price, "marginMode": config.MARGIN_TYPE},
+            )
+        else:
+            # Buy to close short: stop triggers a limit buy above stop
+            limit_price = round(stop_price * 1.005, 8)
+            stop_order = exchange.create_order(
+                symbol, "stop_loss_limit", "buy", qty, limit_price,
+                params={"stopPrice": stop_price, "marginMode": config.MARGIN_TYPE},
+            )
+        log.info(f"[{symbol}] Exchange stop-order placed  id={stop_order.get('id')}  SL={stop_price:.4f}")
+        return stop_order.get("id")
+    except Exception as exc:
+        log.warning(f"[{symbol}] Failed to place exchange stop-order: {exc} — relying on bot-side SL check")
+        return None
+
+
+def _cancel_exchange_stop(exchange: ccxt.binance, symbol: str, stop_order_id: str | None) -> None:
+    """Cancel an existing exchange-side stop order."""
+    if not stop_order_id:
+        return
+    try:
+        exchange.cancel_order(stop_order_id, symbol)
+        log.info(f"[{symbol}] Cancelled exchange stop-order {stop_order_id}")
+    except Exception as exc:
+        log.warning(f"[{symbol}] Could not cancel stop-order {stop_order_id}: {exc}")
 
 
 def _open_long(exchange: ccxt.binance, symbol: str, price: float, state: dict) -> None:
@@ -312,10 +376,13 @@ def _open_long(exchange: ccxt.binance, symbol: str, price: float, state: dict) -
         return
 
     log.info(f"[{symbol}] Opening LONG  qty={qty}  ~price={price:.4f}")
-    order = exchange.create_market_buy_order(symbol, qty, params={"marginMode": "cross"})
+    order = exchange.create_market_buy_order(symbol, qty, params={"marginMode": config.MARGIN_TYPE})
 
     fill_price = float(order.get("average") or order.get("price") or price)
     stop_price = round(fill_price * (1 - config.STOP_LOSS_PCT), 8)
+
+    # Place exchange-side stop order
+    sl_order_id = _place_exchange_stop(exchange, symbol, "long", qty, stop_price)
 
     state[symbol] = {
         "side":        "long",
@@ -325,6 +392,7 @@ def _open_long(exchange: ccxt.binance, symbol: str, price: float, state: dict) -
         "entry_time":  datetime.now(timezone.utc).isoformat(),
         "notional":    float(qty) * fill_price,
         "order_id":    order.get("id"),
+        "sl_order_id": sl_order_id,
     }
     _save_state(state)
     log.info(f"[{symbol}] LONG opened  fill={fill_price:.4f}  SL={stop_price:.4f}")
@@ -340,9 +408,18 @@ def _close_long(
 
     qty = float(pos["qty"])
     log.info(f"[{symbol}] Closing LONG  qty={qty}  reason={reason}")
-    order      = exchange.create_market_sell_order(symbol, qty, params={"marginMode": "cross"})
+
+    # Cancel exchange-side stop order before closing
+    _cancel_exchange_stop(exchange, symbol, pos.get("sl_order_id"))
+
+    order      = exchange.create_market_sell_order(symbol, qty, params={"marginMode": config.MARGIN_TYPE})
     exit_price = float(order.get("average") or order.get("price") or pos["entry_price"])
     pnl        = (exit_price - pos["entry_price"]) * qty
+
+    # Deduct fees from order response if available
+    fee = _extract_fee(order)
+    if fee > 0:
+        pnl -= fee
 
     log.info(f"[{symbol}] LONG closed  exit={exit_price:.4f}  PnL={pnl:+.4f} USDT")
     _log_trade(pos, exit_price, pnl, reason)
@@ -360,11 +437,13 @@ def _open_short(exchange: ccxt.binance, symbol: str, price: float, state: dict) 
 
     log.info(f"[{symbol}] Opening SHORT  qty={qty}  ~price={price:.4f}")
     # On margin, MARGIN_BUY auto-borrows the base asset then sells it to open the short
-    order = exchange.create_market_sell_order(symbol, qty, params={"sideEffectType": "MARGIN_BUY", "marginMode": "cross"})
+    order = exchange.create_market_sell_order(symbol, qty, params={"sideEffectType": "MARGIN_BUY", "marginMode": config.MARGIN_TYPE})
 
     fill_price = float(order.get("average") or order.get("price") or price)
-    # Stop-loss for shorts: price rises above entry by STOP_LOSS_PCT
     stop_price = round(fill_price * (1 + config.STOP_LOSS_PCT), 8)
+
+    # Place exchange-side stop order
+    sl_order_id = _place_exchange_stop(exchange, symbol, "short", qty, stop_price)
 
     state[symbol] = {
         "side":        "short",
@@ -374,6 +453,7 @@ def _open_short(exchange: ccxt.binance, symbol: str, price: float, state: dict) 
         "entry_time":  datetime.now(timezone.utc).isoformat(),
         "notional":    float(qty) * fill_price,
         "order_id":    order.get("id"),
+        "sl_order_id": sl_order_id,
     }
     _save_state(state)
     log.info(f"[{symbol}] SHORT opened  fill={fill_price:.4f}  SL={stop_price:.4f}")
@@ -389,11 +469,19 @@ def _close_short(
 
     qty = float(pos["qty"])
     log.info(f"[{symbol}] Closing SHORT  qty={qty}  reason={reason}")
+
+    # Cancel exchange-side stop order before closing
+    _cancel_exchange_stop(exchange, symbol, pos.get("sl_order_id"))
+
     # AUTO_REPAY buys the base asset and automatically repays the margin loan
-    order      = exchange.create_market_buy_order(symbol, qty, params={"sideEffectType": "AUTO_REPAY", "marginMode": "cross"})
+    order      = exchange.create_market_buy_order(symbol, qty, params={"sideEffectType": "AUTO_REPAY", "marginMode": config.MARGIN_TYPE})
     exit_price = float(order.get("average") or order.get("price") or pos["entry_price"])
-    # Short PnL: profit when price falls
     pnl        = (pos["entry_price"] - exit_price) * qty
+
+    # Deduct fees from order response if available
+    fee = _extract_fee(order)
+    if fee > 0:
+        pnl -= fee
 
     log.info(f"[{symbol}] SHORT closed  exit={exit_price:.4f}  PnL={pnl:+.4f} USDT")
     _log_trade(pos, exit_price, pnl, reason)
@@ -401,6 +489,15 @@ def _close_short(
         circuit.record_pnl(pnl)
     del state[symbol]
     _save_state(state)
+
+
+def _extract_fee(order: dict) -> float:
+    """Extract fee cost from an order response. Returns 0 if not found."""
+    fees = order.get("fees") or []
+    if isinstance(fees, list) and fees:
+        return sum(float(f.get("cost", 0)) for f in fees)
+    fee = order.get("fee") or {}
+    return float(fee.get("cost", 0))
 
 
 def _log_trade(pos: dict, exit_price: float, pnl: float, reason: str) -> None:
@@ -481,12 +578,14 @@ def _mood(score: float) -> str:
 
 # ── Combined decision engine ──────────────────────────────────────────────────
 
-def _decide_action(technical_signal: int, news_score: float, current_side: "str | None") -> tuple[str, str]:
+def _decide_action(technical_signals: dict, news_score: float, current_side: "str | None") -> tuple[str, str]:
     """
-    Combine technical signal and news sentiment into a single trade action.
+    Combine technical signals and news sentiment into a single trade action.
 
     Parameters
     ----------
+    technical_signals : dict with boolean keys long_entry, long_exit, short_entry, short_exit
+    news_score : float, sentiment from -1.0 to +1.0
     current_side : None (no position), 'long', or 'short'
 
     Returns
@@ -499,26 +598,26 @@ def _decide_action(technical_signal: int, news_score: float, current_side: "str 
     ---------------
     Long position open:
         strongly bearish news            → close_long  (news-driven early exit)
-        technical long-exit signal (-1)  → close_long  (standard exit)
+        technical long-exit signal       → close_long  (standard exit)
         otherwise                        → hold
 
     Short position open:
         strongly bullish news            → close_short (news-driven early exit)
-        technical short-exit signal (+2) → close_short (standard exit)
+        technical short-exit signal      → close_short (standard exit)
         otherwise                        → hold
 
     No position:
         Long entry:
             strongly bullish news            → open_long  (news alone)
-            bullish news + tech long  (+1)   → open_long  (double confirmation)
-            neutral + tech long       (+1)   → open_long  (technical-only)
+            bullish news + tech long         → open_long  (double confirmation)
+            neutral + tech long              → open_long  (technical-only)
             bullish but no tech signal       → skip
             bearish / strongly bearish       → skip
 
         Short entry (only when LONG_ONLY=False):
             strongly bearish news            → open_short (news alone)
-            bearish news + tech short (-2)   → open_short (double confirmation)
-            neutral + tech short      (-2)   → open_short (technical-only)
+            bearish news + tech short        → open_short (double confirmation)
+            neutral + tech short             → open_short (technical-only)
             bearish but no tech signal       → skip
             bullish / strongly bullish       → skip
 
@@ -526,14 +625,14 @@ def _decide_action(technical_signal: int, news_score: float, current_side: "str 
     """
     strong_bull = news_score >=  config.NEWS_STRONG_BULL
     weak_bull   = news_score >=  config.NEWS_WEAK_BULL
-    neutral     = abs(news_score) <  config.NEWS_WEAK_BULL
-    weak_bear   = news_score <= -config.NEWS_WEAK_BULL
-    strong_bear = news_score <= -config.NEWS_STRONG_BULL
+    neutral     = news_score >  config.NEWS_WEAK_BEAR and news_score < config.NEWS_WEAK_BULL
+    weak_bear   = news_score <=  config.NEWS_WEAK_BEAR
+    strong_bear = news_score <=  config.NEWS_STRONG_BEAR
 
-    tech_long        = technical_signal ==  1   # long entry
-    tech_long_exit   = technical_signal == -1   # close long
-    tech_short       = technical_signal == -2   # short entry
-    tech_short_exit  = technical_signal ==  2   # close short
+    tech_long        = technical_signals.get("long_entry", False)
+    tech_long_exit   = technical_signals.get("long_exit", False)
+    tech_short       = technical_signals.get("short_entry", False)
+    tech_short_exit  = technical_signals.get("short_exit", False)
 
     # ── Manage open long ──────────────────────────────────────────────────────
     if current_side == "long":
@@ -556,8 +655,6 @@ def _decide_action(technical_signal: int, news_score: float, current_side: "str 
         return "open_long", f"news STRONGLY BULLISH ({news_score:+.3f}) — entering long without technical"
     if weak_bull and tech_long:
         return "open_long", f"bullish news ({news_score:+.3f}) + technical long — double confirmation"
-    if weak_bull and not tech_long:
-        return "open_long", f"bullish news ({news_score:+.3f}) — news-only long entry"
     if neutral and tech_long:
         return "open_long", f"neutral news ({news_score:+.3f}) — technical long signal"
 
@@ -567,8 +664,6 @@ def _decide_action(technical_signal: int, news_score: float, current_side: "str 
             return "open_short", f"news STRONGLY BEARISH ({news_score:+.3f}) — entering short without technical"
         if weak_bear and tech_short:
             return "open_short", f"bearish news ({news_score:+.3f}) + technical short — double confirmation"
-        if weak_bear and not tech_short:
-            return "open_short", f"bearish news ({news_score:+.3f}) — news-only short entry"
         if neutral and tech_short:
             return "open_short", f"neutral news ({news_score:+.3f}) — technical short signal"
 
@@ -576,7 +671,7 @@ def _decide_action(technical_signal: int, news_score: float, current_side: "str 
         return "skip", f"news {'STRONGLY ' if strong_bear else ''}bearish ({news_score:+.3f}) — protecting capital"
 
     log.debug(
-        f"skip — tech={technical_signal}, news={news_score:+.3f}, "
+        f"skip — tech={technical_signals}, news={news_score:+.3f}, "
         f"strong_bull={strong_bull}, weak_bull={weak_bull}, "
         f"neutral={neutral}, weak_bear={weak_bear}, strong_bear={strong_bear}"
     )
@@ -609,7 +704,7 @@ def run_once(
 
     for symbol in symbols:
         try:
-            technical_signal, price = _get_signal(exchange, symbol)
+            technical_signals, price = _get_signal(exchange, symbol)
             news_score = news_scores.get(symbol, 0.0)
 
             # Always check stop-loss first (price-based, not signal-based)
@@ -622,10 +717,10 @@ def run_once(
 
             pos          = state.get(symbol)
             current_side = pos["side"] if pos else None
-            action, reason = _decide_action(technical_signal, news_score, current_side)
+            action, reason = _decide_action(technical_signals, news_score, current_side)
 
             log.info(
-                f"[{symbol}]  price={price:.4f}  tech={technical_signal:+d}  "
+                f"[{symbol}]  price={price:.4f}  tech={technical_signals}  "
                 f"news={news_score:+.3f}  pos={current_side or 'none'}  → {action.upper()}  ({reason})"
             )
 
@@ -685,6 +780,58 @@ def _sync_positions_from_exchange(exchange: ccxt.binance, symbols: list, state: 
             changed = True
         else:
             log.info(f"[{sym}] Position confirmed: {side}  {base} total={total:.8f}  debt={debt:.8f}")
+
+    if changed:
+        _save_state(state)
+
+    # Adopt orphaned exchange positions not in local state
+    for sym in symbols:
+        if sym in state:
+            continue
+        base = sym.split("/")[0] if "/" in sym else sym
+        asset = balance.get(base) or {}
+        total = float(asset.get("total") or 0)
+        debt  = float(asset.get("debt") or asset.get("borrowed") or 0)
+
+        if total > DUST and debt < DUST:
+            # Have base asset, no debt → orphaned long
+            log.warning(f"[{sym}] Orphaned LONG detected on exchange ({base} total={total:.8f}) — adopting.")
+            try:
+                price = _fetch_current_price(exchange, sym)
+                state[sym] = {
+                    "side":        "long",
+                    "entry_price": price,
+                    "qty":         total,
+                    "stop_loss":   round(price * (1 - config.STOP_LOSS_PCT), 8),
+                    "entry_time":  datetime.now(timezone.utc).isoformat(),
+                    "notional":    total * price,
+                    "order_id":    None,
+                    "sl_order_id": None,
+                    "adopted":     True,
+                }
+                changed = True
+            except Exception as exc:
+                log.warning(f"[{sym}] Could not adopt orphaned position: {exc}")
+
+        elif debt > DUST:
+            # Have base debt → orphaned short
+            log.warning(f"[{sym}] Orphaned SHORT detected on exchange ({base} debt={debt:.8f}) — adopting.")
+            try:
+                price = _fetch_current_price(exchange, sym)
+                state[sym] = {
+                    "side":        "short",
+                    "entry_price": price,
+                    "qty":         debt,
+                    "stop_loss":   round(price * (1 + config.STOP_LOSS_PCT), 8),
+                    "entry_time":  datetime.now(timezone.utc).isoformat(),
+                    "notional":    debt * price,
+                    "order_id":    None,
+                    "sl_order_id": None,
+                    "adopted":     True,
+                }
+                changed = True
+            except Exception as exc:
+                log.warning(f"[{sym}] Could not adopt orphaned position: {exc}")
 
     if changed:
         _save_state(state)
