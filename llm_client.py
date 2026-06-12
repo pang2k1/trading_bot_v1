@@ -57,7 +57,8 @@ def reset_client():
     _client = None
 
 
-def complete(system: str, user: str, tools: list[dict] | None = None) -> dict:
+def complete(system: str, user: str, tools: list[dict] | None = None,
+             thinking: bool = False) -> dict:
     """
     Send a chat completion request and return the parsed response.
 
@@ -96,6 +97,12 @@ def complete(system: str, user: str, tools: list[dict] | None = None) -> dict:
         "messages": messages,
         "temperature": 0.0,
     }
+    if not thinking:
+        # DeepSeek V4 models default to thinking mode, which rejects forced
+        # tool_choice (400: "Thinking mode does not support this tool_choice").
+        # Decision calls need non-thinking mode; Phase 2 reflection may pass
+        # thinking=True (and must then not force tool_choice).
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     if tools:
         kwargs["tools"] = [{"type": "function", "function": t} for t in tools]
         kwargs["tool_choice"] = "required"
