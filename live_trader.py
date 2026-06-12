@@ -417,6 +417,16 @@ def _close_long(
     # Cancel exchange-side stop order before closing
     _cancel_exchange_stop(exchange, symbol, pos.get("sl_order_id"))
 
+    # Dust check — if qty is below exchange minimums, drop without placing an order
+    if not _is_closeable(exchange, symbol, qty, pos["entry_price"]):
+        log.warning(
+            f"[{symbol}] Dust LONG (qty={qty:.8f}) below exchange minimums — "
+            f"dropping position without closing order"
+        )
+        del state[symbol]
+        _save_state(state)
+        return
+
     order      = exchange.create_market_sell_order(symbol, qty, params={"marginMode": config.MARGIN_TYPE})
     exit_price = float(order.get("average") or order.get("price") or pos["entry_price"])
     pnl        = (exit_price - pos["entry_price"]) * qty
@@ -479,6 +489,16 @@ def _close_short(
     # Cancel exchange-side stop order before closing
     _cancel_exchange_stop(exchange, symbol, pos.get("sl_order_id"))
 
+    # Dust check — if qty is below exchange minimums, drop without placing an order
+    if not _is_closeable(exchange, symbol, qty, pos["entry_price"]):
+        log.warning(
+            f"[{symbol}] Dust SHORT (qty={qty:.8f}) below exchange minimums — "
+            f"dropping position without closing order"
+        )
+        del state[symbol]
+        _save_state(state)
+        return
+
     # AUTO_REPAY buys the base asset and automatically repays the margin loan
     order      = exchange.create_market_buy_order(symbol, qty, params={"sideEffectType": "AUTO_REPAY", "marginMode": config.MARGIN_TYPE})
     exit_price = float(order.get("average") or order.get("price") or pos["entry_price"])
@@ -496,6 +516,21 @@ def _close_short(
         circuit.record_pnl(pnl)
     del state[symbol]
     _save_state(state)
+
+
+def _is_closeable(exchange: ccxt.binance, symbol: str, qty: float, price: float) -> bool:
+    """Return False if qty or notional is below exchange minimum order limits."""
+    market = exchange.markets.get(symbol)
+    if not market:
+        return True
+    limits = market.get("limits", {})
+    min_qty = (limits.get("amount") or {}).get("min") or 0
+    min_cost = (limits.get("cost") or {}).get("min") or 0
+    if min_qty and qty < min_qty:
+        return False
+    if min_cost and qty * price < min_cost:
+        return False
+    return True
 
 
 def _extract_fee(order: dict) -> float:
@@ -867,9 +902,19 @@ def _sync_positions_from_exchange(exchange: ccxt.binance, symbols: list, state: 
 
         if total > DUST and debt < DUST:
             # Have base asset, no debt → orphaned long
-            log.warning(f"[{sym}] Orphaned LONG detected on exchange ({base} total={total:.8f}) — adopting.")
             try:
                 price = _fetch_current_price(exchange, sym)
+            except Exception as exc:
+                log.warning(f"[{sym}] Could not fetch price for orphan check: {exc}")
+                continue
+            if not _is_closeable(exchange, sym, total, price):
+                log.warning(
+                    f"[{sym}] Ignoring dust — {base} total={total:.8f} "
+                    f"(notional={total*price:.4f}) below exchange minimums"
+                )
+                continue
+            log.warning(f"[{sym}] Orphaned LONG detected on exchange ({base} total={total:.8f}) — adopting.")
+            try:
                 state[sym] = {
                     "side":        "long",
                     "entry_price": price,
@@ -887,9 +932,19 @@ def _sync_positions_from_exchange(exchange: ccxt.binance, symbols: list, state: 
 
         elif debt > DUST:
             # Have base debt → orphaned short
-            log.warning(f"[{sym}] Orphaned SHORT detected on exchange ({base} debt={debt:.8f}) — adopting.")
             try:
                 price = _fetch_current_price(exchange, sym)
+            except Exception as exc:
+                log.warning(f"[{sym}] Could not fetch price for orphan check: {exc}")
+                continue
+            if not _is_closeable(exchange, sym, debt, price):
+                log.warning(
+                    f"[{sym}] Ignoring dust — {base} debt={debt:.8f} "
+                    f"(notional={debt*price:.4f}) below exchange minimums"
+                )
+                continue
+            log.warning(f"[{sym}] Orphaned SHORT detected on exchange ({base} debt={debt:.8f}) — adopting.")
+            try:
                 state[sym] = {
                     "side":        "short",
                     "entry_price": price,
