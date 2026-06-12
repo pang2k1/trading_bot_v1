@@ -61,7 +61,24 @@ def _init_tables(conn: sqlite3.Connection) -> None:
             max_adverse_excursion  REAL DEFAULT 0,
             max_favorable_excursion REAL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS reflections (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp           TEXT    NOT NULL,
+            edits_json          TEXT    NOT NULL,
+            trades_reviewed     INTEGER DEFAULT 0,
+            edits_applied       INTEGER DEFAULT 0,
+            edits_rejected      INTEGER DEFAULT 0,
+            model               TEXT,
+            prompt_tokens       INTEGER DEFAULT 0,
+            completion_tokens   INTEGER DEFAULT 0
+        );
     """)
+    # Safe migrations — add columns if they don't exist yet
+    try:
+        conn.execute("ALTER TABLE decisions ADD COLUMN lessons_applied_json TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 
@@ -76,6 +93,7 @@ def record_decision(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     executed: bool = False,
+    lessons_applied: list[str] | None = None,
 ) -> int:
     """Record an LLM decision. Returns the decision ID."""
     conn = _connect()
@@ -84,8 +102,8 @@ def record_decision(
             """INSERT INTO decisions
                (timestamp, briefing_json, action, confidence, size_multiplier,
                 reasoning, invalidation_price, model, prompt_tokens,
-                completion_tokens, executed)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                completion_tokens, executed, lessons_applied_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 json.dumps(briefing, ensure_ascii=False),
@@ -98,6 +116,7 @@ def record_decision(
                 prompt_tokens,
                 completion_tokens,
                 1 if executed else 0,
+                json.dumps(lessons_applied or []),
             ),
         )
         conn.commit()
@@ -231,5 +250,142 @@ def get_monthly_token_spend() -> dict:
                WHERE timestamp >= datetime('now', 'start of month')"""
         ).fetchone()
         return dict(row) if row else {"prompt_tokens": 0, "completion_tokens": 0, "total_calls": 0}
+    finally:
+        conn.close()
+
+
+def get_yesterday_closed_trades() -> list[dict]:
+    """Fetch yesterday's closed trades with original reasoning + outcomes."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT d.id as decision_id, d.timestamp, d.action, d.confidence,
+                      d.size_multiplier, d.reasoning, d.invalidation_price,
+                      d.lessons_applied_json,
+                      o.entry_price, o.exit_price, o.entry_time, o.exit_time,
+                      o.pnl_usd, o.pnl_pct, o.exit_reason,
+                      o.max_adverse_excursion, o.max_favorable_excursion
+               FROM decisions d
+               JOIN outcomes o ON o.decision_id = d.id
+               WHERE d.action IN ('open_long', 'open_short')
+                 AND d.timestamp >= datetime('now', '-1 day', 'start of day')
+                 AND d.timestamp < datetime('now', 'start of day')
+               ORDER BY d.timestamp ASC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_rolling_stats(days: int = 7) -> dict:
+    """Rolling performance stats for reflection context."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """SELECT
+                 COUNT(*) as total_trades,
+                 SUM(CASE WHEN o.pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
+                 COALESCE(SUM(o.pnl_usd), 0) as total_pnl,
+                 COALESCE(AVG(o.pnl_pct), 0) as avg_pnl_pct,
+                 COALESCE(AVG(CASE WHEN o.pnl_usd > 0 THEN o.pnl_pct END), 0) as avg_win_pct,
+                 COALESCE(AVG(CASE WHEN o.pnl_usd <= 0 THEN o.pnl_pct END), 0) as avg_loss_pct,
+                 COALESCE(MIN(o.pnl_usd), 0) as worst_trade,
+                 COALESCE(MAX(o.pnl_usd), 0) as best_trade
+               FROM decisions d
+               JOIN outcomes o ON o.decision_id = d.id
+               WHERE d.action IN ('open_long', 'open_short')
+                 AND d.timestamp >= datetime('now', ?)""",
+            (f"-{days} days",),
+        ).fetchone()
+
+        if not row or row["total_trades"] == 0:
+            return {"total_trades": 0}
+
+        total = row["total_trades"]
+        wins = row["wins"] or 0
+        return {
+            "total_trades": total,
+            "wins": wins,
+            "losses": total - wins,
+            "win_rate": round(wins / total * 100, 1),
+            "total_pnl": round(row["total_pnl"], 4),
+            "avg_pnl_pct": round(row["avg_pnl_pct"], 2),
+            "avg_win_pct": round(row["avg_win_pct"], 2),
+            "avg_loss_pct": round(row["avg_loss_pct"], 2),
+            "worst_trade": round(row["worst_trade"], 4),
+            "best_trade": round(row["best_trade"], 4),
+        }
+    finally:
+        conn.close()
+
+
+def get_lesson_hit_counts(since_days: int = 30) -> dict[str, int]:
+    """Count how many times each lesson was applied in decisions."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT lessons_applied_json
+               FROM decisions
+               WHERE timestamp >= datetime('now', ?)
+                 AND lessons_applied_json IS NOT NULL""",
+            (f"-{since_days} days",),
+        ).fetchall()
+
+        counts: dict[str, int] = {}
+        for row in rows:
+            try:
+                ids = json.loads(row["lessons_applied_json"])
+                for lid in ids:
+                    counts[lid] = counts.get(lid, 0) + 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return counts
+    finally:
+        conn.close()
+
+
+def record_reflection(
+    edits: list[dict],
+    trades_reviewed: int = 0,
+    edits_applied: int = 0,
+    edits_rejected: int = 0,
+    model: str = "",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> int:
+    """Record a reflection run for auditing."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """INSERT INTO reflections
+               (timestamp, edits_json, trades_reviewed, edits_applied,
+                edits_rejected, model, prompt_tokens, completion_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                json.dumps(edits, ensure_ascii=False),
+                trades_reviewed,
+                edits_applied,
+                edits_rejected,
+                model,
+                prompt_tokens,
+                completion_tokens,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_recent_reflections(limit: int = 30) -> list[dict]:
+    """Fetch recent reflection runs for context."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM reflections ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

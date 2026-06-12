@@ -58,7 +58,7 @@ def reset_client():
 
 
 def complete(system: str, user: str, tools: list[dict] | None = None,
-             thinking: bool = False) -> dict:
+             thinking: bool = False, model: str | None = None) -> dict:
     """
     Send a chat completion request and return the parsed response.
 
@@ -85,7 +85,7 @@ def complete(system: str, user: str, tools: list[dict] | None = None,
     Exception on API error (caller should catch and fallback).
     """
     client = _get_client()
-    model = getattr(config, "LLM_DECISION_MODEL", "deepseek-v4-flash")
+    model = model or getattr(config, "LLM_DECISION_MODEL", "deepseek-v4-flash")
 
     messages = [
         {"role": "system", "content": system},
@@ -105,7 +105,8 @@ def complete(system: str, user: str, tools: list[dict] | None = None,
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     if tools:
         kwargs["tools"] = [{"type": "function", "function": t} for t in tools]
-        kwargs["tool_choice"] = "required"
+        if not thinking:
+            kwargs["tool_choice"] = "required"
 
     response = client.chat.completions.create(**kwargs)
 

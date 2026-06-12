@@ -108,3 +108,12 @@ LLM_MIN_CONFIDENCE     = 0.6                 # entries below this → forced hol
 LLM_TIMEOUT            = 30                  # seconds
 LLM_MAX_RETRIES        = 1                   # retry count on API failure
 LLM_BRAIN_MODE         = "shadow"            # "shadow" (journal only) | "rules" (off) | "llm" (live, Phase 3)
+
+# ── LLM Trader (Phase 2 — Reflection) ──────────────────────────────────────────
+LLM_REFLECTION_MODEL    = "deepseek-v4-pro"   # stronger model for daily reflection (uses thinking mode)
+LLM_REFLECTION_TIMEOUT  = 120                  # seconds — reflection prompt is heavier
+PLAYBOOK_MAX_LESSONS    = 20                   # hard cap on playbook size
+PLAYBOOK_MAX_WORDS      = 150                  # max words per lesson text
+PLAYBOOK_MAX_EDITS_DAY  = 3                    # max edits per reflection run
+PLAYBOOK_DECAY_DAYS     = 30                   # days without use before lesson flagged for decay
+REFLECTION_STATS_DAYS   = 7                    # rolling stats window for reflection input

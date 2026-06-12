@@ -262,6 +262,7 @@ def make_decision(
             prompt_tokens=response.get("prompt_tokens", 0),
             completion_tokens=response.get("completion_tokens", 0),
             executed=False,  # shadow mode — not executed
+            lessons_applied=decision.get("lessons_applied", []),
         )
     except Exception as exc:
         log.warning(f"[llm] Journal write failed: {exc}")
