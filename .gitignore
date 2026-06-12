@@ -198,3 +198,5 @@ playbook.md
 
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
+docs/architecture.html
+.DS_Store
