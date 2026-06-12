@@ -56,7 +56,7 @@ git diff --cached | grep -nEi '(api[_-]?key|api[_-]?secret|secret|token|passw(or
 git diff --cached | grep -nE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_|xox[bporas]-|sk-[A-Za-z0-9]{20,}|sk-ant-|eyJ[A-Za-z0-9_-]{20,}\.eyJ|[0-9]{8,10}:[A-Za-z0-9_-]{35})' && echo "FAIL: token detected"
 
 # .env values accidentally pasted into code/docs
-git diff --cached | grep -nE '(TESTNET_API_KEY|TESTNET_SECRET|LIVE_API_KEY|LIVE_SECRET|WEB_UI_PASSWORD|DEEPSEEK_API_KEY)\s*=\s*[^"\s]{4,}' && echo "FAIL: env value in diff"
+git diff --cached | grep -nE '(TESTNET_API_KEY|TESTNET_SECRET|LIVE_API_KEY|LIVE_SECRET|WEB_UI_PASSWORD|DEEPSEEK_API_KEY|GMAIL_APP_PASSWORD)\s*=\s*[^"\s]{4,}' && echo "FAIL: env value in diff"
 ```
 
 - [ ] All four scans clean.
