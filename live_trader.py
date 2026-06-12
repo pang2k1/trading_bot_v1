@@ -751,7 +751,6 @@ def run_once(
     state: dict,
     news_cache: NewsCache,
     circuit: DailyCircuitBreaker,
-    brain_mode: str = "shadow",
 ) -> None:
     """Evaluate all symbols once and act on signals."""
 
@@ -799,17 +798,24 @@ def run_once(
             elif action == "close_short":
                 _close_short(exchange, symbol, state, reason=reason, circuit=circuit)
 
-            # ── LLM shadow mode ──────────────────────────────────────────────
-            # After the rule engine acts, run the LLM brain and journal its
-            # decision (but do NOT execute it).
-            if brain_mode in ("shadow", "llm"):
-                _run_llm_shadow(
-                    exchange, symbol, state, news_scores,
-                    circuit, current_balance,
-                )
-
         except Exception as exc:
             log.error(f"[{symbol}] Error in evaluation cycle: {exc}", exc_info=True)
+
+
+def run_llm_cycle(
+    exchange: ccxt.binance,
+    symbols: list,
+    state: dict,
+    news_cache: NewsCache,
+    circuit: DailyCircuitBreaker,
+    balance: float,
+) -> None:
+    """Run one LLM decision cycle for all symbols (shadow or live brain)."""
+    for symbol in symbols:
+        _run_llm_shadow(
+            exchange, symbol, state, news_cache.get(symbols),
+            circuit, balance,
+        )
 
 
 def _run_llm_shadow(
@@ -1053,7 +1059,13 @@ def main() -> None:
     )
 
     if args.once:
-        run_once(exchange, symbols, state, news_cache, circuit, brain_mode=brain_mode)
+        run_once(exchange, symbols, state, news_cache, circuit)
+        if brain_mode in ("shadow", "llm"):
+            try:
+                balance = _get_usdt_balance(exchange)
+                run_llm_cycle(exchange, symbols, state, news_cache, circuit, balance)
+            except Exception as exc:
+                log.error(f"LLM cycle error: {exc}", exc_info=True)
         return
 
     log.info(f"Running continuously — signals every {config.BASE_TF} bar, SL checked every 60s.")
@@ -1062,7 +1074,9 @@ def main() -> None:
     _params_mtime = PARAMS_FILE.stat().st_mtime if PARAMS_FILE.exists() else 0
     # -1 ensures a full run fires immediately on first iteration
     _last_full_run_bar: int = -1
+    _last_llm_bar: int = -1
     _period = TF_SECONDS.get(config.BASE_TF, 900)
+    _llm_period = TF_SECONDS.get(config.LLM_DECISION_TF, 3600)
 
     while True:
         # Hot reload: pick up new best_params.json without restarting.
@@ -1083,10 +1097,20 @@ def main() -> None:
         if current_bar_ts != _last_full_run_bar:
             # New bar closed — run full signal + entry/exit cycle
             try:
-                run_once(exchange, symbols, state, news_cache, circuit, brain_mode=brain_mode)
+                run_once(exchange, symbols, state, news_cache, circuit)
             except Exception as exc:
                 log.error(f"Unexpected error in main loop: {exc}", exc_info=True)
             _last_full_run_bar = current_bar_ts
+
+            # LLM decision cycle — only on new LLM-period bars
+            current_llm_bar = int((now_ts - 10) // _llm_period) * _llm_period
+            if current_llm_bar != _last_llm_bar and brain_mode in ("shadow", "llm"):
+                try:
+                    balance = _get_usdt_balance(exchange)
+                    run_llm_cycle(exchange, symbols, state, news_cache, circuit, balance)
+                except Exception as exc:
+                    log.error(f"LLM cycle error: {exc}", exc_info=True)
+                _last_llm_bar = current_llm_bar
             secs_to_next = _period - (time.time() % _period) + 10
             log.info(
                 f"Next bar in ~{secs_to_next:.0f}s  "
