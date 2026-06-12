@@ -192,5 +192,9 @@ news_report.json
 data/
 *.parquet
 
+# LLM trader runtime files
+journal.db
+playbook.md
+
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json

@@ -97,3 +97,14 @@ NEWS_WEAK_BULL        =  0.15   # positive but needs technical confirmation
 NEWS_WEAK_BEAR        = -0.08   # skip new entries (same magnitude, negative)
 NEWS_STRONG_BEAR      = -0.25   # exit existing longs early
 NEWS_REFRESH_HOURS    =  4      # re-fetch news every N hours
+
+# ── LLM Trader (Phase 1) ──────────────────────────────────────────────────────
+# Provider: DeepSeek via OpenAI-compatible API.
+# LLM proposes, code disposes — all risk controls remain deterministic Python.
+LLM_BASE_URL           = "https://api.deepseek.com"
+LLM_DECISION_MODEL     = "deepseek-v4-flash" # per-cycle decisions (fast, cheap; legacy "deepseek-chat" deprecated July 2026)
+LLM_DECISION_TF        = "1h"                # LLM runs every closed 1h bar
+LLM_MIN_CONFIDENCE     = 0.6                 # entries below this → forced hold
+LLM_TIMEOUT            = 30                  # seconds
+LLM_MAX_RETRIES        = 1                   # retry count on API failure
+LLM_BRAIN_MODE         = "shadow"            # "shadow" (journal only) | "rules" (off) | "llm" (live, Phase 3)

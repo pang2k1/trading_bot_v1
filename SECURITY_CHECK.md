@@ -13,6 +13,7 @@ This repo controls real money via Binance API keys. A leaked key = stolen funds.
 | `.env` (any variant: `.env.live`, `.env.backup`, `.env.old`) | Binance API keys, web UI password |
 | `trader_state.json`, `trades_log.csv`, `live_trader.log`, `*.log` | Account balances, positions, trade history |
 | `best_params.json`, `optimization_results.json`, `news_report.json` | Runtime artifacts |
+| `journal.db`, `playbook.md` | LLM trade history, evolving trading lessons — contain account data |
 | `.claude/settings.local.json` | Machine-specific settings |
 | `venv/`, `data/*.parquet`, `*.csv` data caches | Bloat; caches may embed account data |
 | Any file containing a key, secret, token, password, seed phrase, or private key | Obvious |
@@ -55,7 +56,7 @@ git diff --cached | grep -nEi '(api[_-]?key|api[_-]?secret|secret|token|passw(or
 git diff --cached | grep -nE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_|xox[bporas]-|sk-[A-Za-z0-9]{20,}|sk-ant-|eyJ[A-Za-z0-9_-]{20,}\.eyJ|[0-9]{8,10}:[A-Za-z0-9_-]{35})' && echo "FAIL: token detected"
 
 # .env values accidentally pasted into code/docs
-git diff --cached | grep -nE '(TESTNET_API_KEY|TESTNET_SECRET|LIVE_API_KEY|LIVE_SECRET|WEB_UI_PASSWORD)\s*=\s*[^"\s]{4,}' && echo "FAIL: env value in diff"
+git diff --cached | grep -nE '(TESTNET_API_KEY|TESTNET_SECRET|LIVE_API_KEY|LIVE_SECRET|WEB_UI_PASSWORD|DEEPSEEK_API_KEY)\s*=\s*[^"\s]{4,}' && echo "FAIL: env value in diff"
 ```
 
 - [ ] All four scans clean.
@@ -83,7 +84,7 @@ git diff --cached | grep -nE '(/Users/[a-z0-9_.-]+|/home/[a-z0-9_.-]+|([0-9]{1,3
 ## 5. Dependency & config sanity
 
 - [ ] No new dependency added from an unknown/typosquatted package name (verify spelling on PyPI before committing changes to `requirements.txt`).
-- [ ] `.gitignore` still contains: `.env`, `*.log`, `trader_state.json`, `trades_log.csv`, `best_params.json`, `optimization_results.json`, `news_report.json`, `venv/`. If new runtime/data files were introduced in this change (e.g. `data/` cache, pidfile), add them to `.gitignore` in the same commit.
+- [ ] `.gitignore` still contains: `.env`, `*.log`, `trader_state.json`, `trades_log.csv`, `best_params.json`, `optimization_results.json`, `news_report.json`, `journal.db`, `playbook.md`, `venv/`. If new runtime/data files were introduced in this change (e.g. `data/` cache, pidfile), add them to `.gitignore` in the same commit.
 
 ## 6. Final gate
 

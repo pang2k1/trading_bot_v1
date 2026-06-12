@@ -27,6 +27,9 @@ Usage
     python live_trader.py               # run continuously on testnet
     python live_trader.py --once        # single cycle (good for testing)
     python live_trader.py --live        # REAL MONEY — requires LIVE_API_KEY + LIVE_SECRET
+    python live_trader.py --brain shadow  # shadow mode: LLM journals but doesn't trade (default)
+    python live_trader.py --brain rules   # disable LLM, rule engine only
+    python live_trader.py --brain llm     # LLM drives trades (Phase 3 — not yet safe)
 
 Notes
 -----
@@ -60,6 +63,8 @@ import config
 import indicators
 import strategy
 import news_analyzer
+import llm_trader
+import journal as llm_journal
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -423,6 +428,7 @@ def _close_long(
 
     log.info(f"[{symbol}] LONG closed  exit={exit_price:.4f}  PnL={pnl:+.4f} USDT")
     _log_trade(pos, exit_price, pnl, reason)
+    _record_llm_outcome(pos, exit_price, pnl, reason)
     if circuit is not None:
         circuit.record_pnl(pnl)
     del state[symbol]
@@ -485,6 +491,7 @@ def _close_short(
 
     log.info(f"[{symbol}] SHORT closed  exit={exit_price:.4f}  PnL={pnl:+.4f} USDT")
     _log_trade(pos, exit_price, pnl, reason)
+    _record_llm_outcome(pos, exit_price, pnl, reason)
     if circuit is not None:
         circuit.record_pnl(pnl)
     del state[symbol]
@@ -514,6 +521,29 @@ def _log_trade(pos: dict, exit_price: float, pnl: float, reason: str) -> None:
     }
     header = not TRADES_LOG.exists()
     pd.DataFrame([row]).to_csv(TRADES_LOG, mode="a", header=header, index=False)
+
+
+# ── LLM journal outcome hook ──────────────────────────────────────────────────
+
+def _record_llm_outcome(pos: dict, exit_price: float, pnl: float, reason: str) -> None:
+    """Record the outcome for any pending LLM decision that opened this position."""
+    try:
+        pending = llm_journal.get_decisions_without_outcomes(limit=10)
+        for d in pending:
+            if d.get("action") in ("open_long", "open_short"):
+                llm_journal.record_outcome(
+                    decision_id=d["id"],
+                    entry_price=float(pos["entry_price"]),
+                    exit_price=exit_price,
+                    entry_time=pos["entry_time"],
+                    exit_time=datetime.now(timezone.utc).isoformat(),
+                    pnl_usd=pnl,
+                    exit_reason=reason,
+                )
+                log.info(f"[llm] Outcome recorded for decision {d['id']}: PnL={pnl:+.4f}")
+                break
+    except Exception as exc:
+        log.warning(f"[llm] Could not record outcome: {exc}")
 
 
 # ── Stop-loss check ───────────────────────────────────────────────────────────
@@ -686,6 +716,7 @@ def run_once(
     state: dict,
     news_cache: NewsCache,
     circuit: DailyCircuitBreaker,
+    brain_mode: str = "shadow",
 ) -> None:
     """Evaluate all symbols once and act on signals."""
 
@@ -733,8 +764,49 @@ def run_once(
             elif action == "close_short":
                 _close_short(exchange, symbol, state, reason=reason, circuit=circuit)
 
+            # ── LLM shadow mode ──────────────────────────────────────────────
+            # After the rule engine acts, run the LLM brain and journal its
+            # decision (but do NOT execute it).
+            if brain_mode in ("shadow", "llm"):
+                _run_llm_shadow(
+                    exchange, symbol, state, news_scores,
+                    circuit, current_balance,
+                )
+
         except Exception as exc:
             log.error(f"[{symbol}] Error in evaluation cycle: {exc}", exc_info=True)
+
+
+def _run_llm_shadow(
+    exchange: ccxt.binance, symbol: str, state: dict,
+    news_scores: dict, circuit: DailyCircuitBreaker, balance: float,
+) -> None:
+    """Run the LLM decision engine and journal the result (shadow mode)."""
+    try:
+        frames = {
+            config.BASE_TF:   _fetch_recent_bars(exchange, symbol, config.BASE_TF),
+            config.TREND_TF1: _fetch_recent_bars(exchange, symbol, config.TREND_TF1),
+            config.TREND_TF2: _fetch_recent_bars(exchange, symbol, config.TREND_TF2),
+        }
+        df = indicators.build(frames)
+
+        llm_decision = llm_trader.make_decision(
+            df=df,
+            symbol=symbol,
+            balance=balance,
+            state=state if state else None,
+            news_cache=news_scores,
+            circuit_daily_pnl=circuit._daily_pnl,
+            circuit_start_balance=circuit._start_balance,
+            circuit_halted=circuit.halted,
+        )
+        log.info(
+            f"[llm-shadow] {symbol}: {llm_decision['action']}  "
+            f"conf={llm_decision.get('confidence', 0):.2f}  "
+            f"id={llm_decision.get('decision_id', 0)}"
+        )
+    except Exception as exc:
+        log.warning(f"[llm-shadow] {symbol} LLM call failed: {exc}")
 
 
 # ── Startup position sync ────────────────────────────────────────────────────
@@ -882,10 +954,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Binance live trading bot")
     parser.add_argument("--once", action="store_true", help="Run one cycle then exit")
     parser.add_argument("--live", action="store_true", help="Use real Binance (NOT testnet)")
+    parser.add_argument(
+        "--brain", default="shadow",
+        choices=["shadow", "rules", "llm"],
+        help="LLM brain mode: shadow (journal only, default), rules (off), llm (live, Phase 3)",
+    )
     args = parser.parse_args()
 
     _load_best_params()
 
+    brain_mode = args.brain
     testnet     = not args.live
     exchange    = _connect(testnet=testnet)
     state       = _load_state()
@@ -909,7 +987,7 @@ def main() -> None:
         log.warning("=" * 60)
 
     mode_str = "LIVE" if args.live else "TESTNET"
-    log.info(f"Bot started  mode={mode_str}  symbols={symbols}  tf={config.BASE_TF}")
+    log.info(f"Bot started  mode={mode_str}  symbols={symbols}  tf={config.BASE_TF}  brain={brain_mode}")
     log.info(
         f"Params  BB({config.BB_PERIOD},{config.BB_STD})  "
         f"RSI({config.RSI_PERIOD})  SL={config.STOP_LOSS_PCT*100:.1f}%  "
@@ -920,7 +998,7 @@ def main() -> None:
     )
 
     if args.once:
-        run_once(exchange, symbols, state, news_cache, circuit)
+        run_once(exchange, symbols, state, news_cache, circuit, brain_mode=brain_mode)
         return
 
     log.info(f"Running continuously — signals every {config.BASE_TF} bar, SL checked every 60s.")
@@ -950,7 +1028,7 @@ def main() -> None:
         if current_bar_ts != _last_full_run_bar:
             # New bar closed — run full signal + entry/exit cycle
             try:
-                run_once(exchange, symbols, state, news_cache, circuit)
+                run_once(exchange, symbols, state, news_cache, circuit, brain_mode=brain_mode)
             except Exception as exc:
                 log.error(f"Unexpected error in main loop: {exc}", exc_info=True)
             _last_full_run_bar = current_bar_ts
