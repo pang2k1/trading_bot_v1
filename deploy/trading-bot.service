@@ -1,0 +1,14 @@
+[Unit]
+Description=Trading Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/root/bot_new
+ExecStart=/root/bot_new/venv/bin/python live_trader.py --live
+Restart=always
+RestartSec=10
+User=root
+EnvironmentFile=/root/bot_new/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+# Nightly LLM reflection — reviews closed trades, updates playbook.md
+15 0 * * * cd /root/bot_new && /root/bot_new/venv/bin/python reflect.py >> reflect.log 2>&1
+
+# Daily status digest emailed via Gmail (read each morning by the Claude monitor task)
+30 0 * * * cd /root/bot_new && /root/bot_new/venv/bin/python daily_report.py >> report.log 2>&1

@@ -52,7 +52,7 @@ python compare.py                     # shadow-phase comparison report
 python daily_report.py --print        # status digest (omit --print to email)
 ```
 
-`--brain shadow|rules|llm` controls the LLM's role (default `shadow`: journal only, never execute). `llm` mode is gated behind the Phase 3 criteria in `LLM_TRADER_PLAN.md`.
+`--brain shadow|rules|llm` controls the LLM's role (default `shadow`: journal only, never execute). `llm` mode is gated behind the Phase 3 criteria in `docs/LLM_TRADER_PLAN.md`.
 
 ## Production deployment
 
@@ -62,7 +62,7 @@ Monitoring: the daily email digest is read each morning by a scheduled Claude ta
 
 ## Project docs
 
-`LLM_TRADER_PLAN.md` — the phased LLM design and promotion gates. `FIXES.md` — the audit checklist that drove the 2026-06-12 overhaul (24 issues, including a signal-collision bug that prevented all entries, look-ahead bias, and broken short accounting). `SECURITY_CHECK.md` — mandatory pre-commit checklist (enforced via `CLAUDE.md` for Claude Code); never commit `.env`, runtime state, logs, `journal.db`, or `playbook.md`.
+`docs/LLM_TRADER_PLAN.md` — the phased LLM design and promotion gates. `docs/FIXES.md` — the audit checklist that drove the 2026-06-12 overhaul (24 issues, including a signal-collision bug that prevented all entries, look-ahead bias, and broken short accounting). `SECURITY_CHECK.md` — mandatory pre-commit checklist (enforced via `CLAUDE.md` for Claude Code); never commit `.env`, runtime state, logs, `journal.db`, or `playbook.md`.
 
 ## Disclaimer
 

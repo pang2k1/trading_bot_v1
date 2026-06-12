@@ -15,4 +15,4 @@ Never commit or push without being explicitly asked.
 
 - This is a live crypto trading bot — code handles real money and Binance API keys.
 - `.env` holds all secrets and must never be read into output, logged, or committed.
-- Pending work items are tracked in `FIXES.md`.
+- The 2026-06-12 audit history is in `docs/FIXES.md`; the LLM roadmap in `docs/LLM_TRADER_PLAN.md`.

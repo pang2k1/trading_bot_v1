@@ -1,0 +1,14 @@
+[Unit]
+Description=Trading Bot Web UI
+After=network.target
+
+[Service]
+WorkingDirectory=/root/bot_new
+ExecStart=/root/bot_new/venv/bin/python web_ui.py
+Restart=always
+RestartSec=10
+User=root
+EnvironmentFile=/root/bot_new/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Trading Bot Optimizer
+After=network.target
+
+[Service]
+WorkingDirectory=/root/bot_new
+ExecStart=/root/bot_new/venv/bin/python optimizer.py --schedule --trials 200 --days 7
+Restart=always
+RestartSec=30
+User=root
+EnvironmentFile=/root/bot_new/.env
+
+[Install]
+WantedBy=multi-user.target
