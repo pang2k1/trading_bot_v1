@@ -207,7 +207,10 @@ def send_email(report: str) -> None:
     msg["To"] = addr
     msg.set_content(report)
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+    # Port 587 + STARTTLS — Hetzner Cloud blocks outbound 25/465 by default,
+    # but 587 is open without any support request.
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+        smtp.starttls()
         smtp.login(addr, app_pw)
         smtp.send_message(msg)
 
