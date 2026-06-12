@@ -367,6 +367,23 @@ h2{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)
 .ll{white-space:pre-wrap;word-break:break-all;line-height:1.6;font-size:11.5px}
 .ll.W{color:var(--yellow)}.ll.E{color:var(--red)}
 .ll .ts{color:#484f58}.ll .lv{color:var(--blue)}
+
+/* ── Mobile (≤820px): stacked, scrollable layout ─────────────── */
+@media (max-width:820px){
+  body{height:auto;min-height:100vh;overflow:auto;font-size:14px}
+  header{flex-wrap:wrap;position:sticky;top:0;z-index:10;padding:10px 12px}
+  h1{font-size:14px}
+  .cmp-strip{flex-wrap:wrap;gap:8px;padding:8px 12px}
+  .main{display:flex;flex-direction:column;overflow:visible}
+  .pane{border-right:none;border-bottom:1px solid var(--border);overflow-y:visible;padding:12px}
+  /* long card lists scroll inside their section instead of stretching the page */
+  #trades-body,#llm-body{max-height:55vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+  /* finger-sized controls; 16px inputs stop iOS zoom-on-focus */
+  .field input{font-size:16px;padding:9px 10px}
+  button{padding:10px 14px;font-size:14px}
+  .btn-apply{padding:12px}
+  .log-wrap{height:35vh}
+}
 </style>
 </head>
 <body>
