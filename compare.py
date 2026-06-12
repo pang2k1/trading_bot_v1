@@ -14,6 +14,8 @@ Usage
 """
 
 import argparse
+import json
+import math
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -27,6 +29,11 @@ JOURNAL_DB = Path("journal.db")
 # Simulated costs for LLM paper trades
 SIMULATED_SLIPPAGE = 0.0005  # 0.05% per fill
 SIMULATED_FEE = 0.001        # 0.1% per side
+
+
+def _sanitize_json(d: dict) -> dict:
+    """Replace inf/nan floats with None so json.dumps doesn't choke."""
+    return {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in d.items()}
 
 
 def _load_rule_trades(days: int | None = None) -> pd.DataFrame:
@@ -174,33 +181,20 @@ def _compute_agreement(decisions: list[dict], rule_df: pd.DataFrame) -> float:
 
 
 def run_report(days: int | None = 7) -> None:
-    """Print the comparison report."""
+    """Print the comparison report (CLI)."""
+    data = get_comparison_data(days)
+
     period_str = f"last {days} days" if days else "all time"
     print(f"\n{'='*64}")
     print(f"  LLM vs Rule Engine Comparison Report  —  {period_str}")
     print(f"  Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*64}\n")
 
-    rule_df = _load_rule_trades(days)
-    llm_decisions = _load_llm_decisions(days)
+    rule_stats = data["rule"]
+    llm_stats = data["llm"]
+    bah_pnl = data["buy_and_hold"]["pnl"]
+    agreement = data["agreement_pct"]
 
-    rule_stats = _compute_rule_stats(rule_df)
-    llm_stats = _simulate_llm_pnl(llm_decisions)
-
-    # Buy and hold (approximate from first/last rule trade)
-    bah_pnl = 0.0
-    if not rule_df.empty:
-        try:
-            entries = rule_df["entry_price"].astype(float)
-            if len(entries) >= 2:
-                # Rough: use first entry as buy price, last exit as sell price
-                bah_pnl = float(entries.iloc[-1]) - float(entries.iloc[0])
-        except Exception:
-            pass
-
-    agreement = _compute_agreement(llm_decisions, rule_df)
-
-    # Print table
     def fmt(val, is_pct=False):
         if val == float("inf"):
             return "INF"
@@ -239,10 +233,47 @@ def run_report(days: int | None = 7) -> None:
         print(f"{label:<20} {str(rule_val):>14} {str(llm_val):>16} {str(bah_val):>12}")
 
     print(f"\nDecision agreement (LLM ↔ rules): {agreement:.1f}%")
-    print(f"LLM decisions in journal: {len(llm_decisions)}")
-    print(f"Rule trades in log: {len(rule_df)}")
+    print(f"LLM decisions in journal: {data['llm_decisions']}")
+    print(f"Rule trades in log: {data['rule_trades']}")
 
-    # Token cost estimate
+    cost = data["estimated_cost_usd"]
+    pt = data["prompt_tokens"]
+    ct = data["completion_tokens"]
+    if pt or ct:
+        print(f"Token usage: {pt:,} in + {ct:,} out  (~${cost:.4f} estimated)")
+
+    print(f"\n{'='*64}\n")
+
+
+def get_comparison_data(days: int | None = 7) -> dict:
+    """
+    Compute LLM vs rule vs buy-and-hold comparison data.
+
+    Returns a dict with keys:
+      rule, llm, buy_and_hold, agreement_pct,
+      llm_decisions, rule_trades,
+      prompt_tokens, completion_tokens, estimated_cost_usd
+    """
+    rule_df = _load_rule_trades(days)
+    llm_decisions = _load_llm_decisions(days)
+
+    rule_stats = _compute_rule_stats(rule_df)
+    llm_stats = _simulate_llm_pnl(llm_decisions)
+
+    bah_pnl = 0.0
+    if not rule_df.empty:
+        try:
+            entries = rule_df["entry_price"].astype(float)
+            if len(entries) >= 2:
+                bah_pnl = float(entries.iloc[-1]) - float(entries.iloc[0])
+        except Exception:
+            pass
+
+    agreement = _compute_agreement(llm_decisions, rule_df)
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    cost = 0.0
     if JOURNAL_DB.exists():
         conn = sqlite3.connect(str(JOURNAL_DB))
         try:
@@ -250,15 +281,23 @@ def run_report(days: int | None = 7) -> None:
                 "SELECT SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct FROM decisions"
             ).fetchone()
             if row:
-                pt = row[0] or 0
-                ct = row[1] or 0
-                # DeepSeek pricing: ~$0.14/M input, $0.28/M output (cached input cheaper)
-                cost = pt * 0.14 / 1e6 + ct * 0.28 / 1e6
-                print(f"Token usage: {pt:,} in + {ct:,} out  (~${cost:.4f} estimated)")
+                prompt_tokens = row[0] or 0
+                completion_tokens = row[1] or 0
+                cost = prompt_tokens * 0.14 / 1e6 + completion_tokens * 0.28 / 1e6
         finally:
             conn.close()
 
-    print(f"\n{'='*64}\n")
+    return {
+        "rule": _sanitize_json(rule_stats),
+        "llm": _sanitize_json(llm_stats),
+        "buy_and_hold": {"pnl": round(bah_pnl, 4)},
+        "agreement_pct": agreement,
+        "llm_decisions": len(llm_decisions),
+        "rule_trades": len(rule_df),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "estimated_cost_usd": round(cost, 4),
+    }
 
 
 def main() -> None:

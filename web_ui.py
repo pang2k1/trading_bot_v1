@@ -34,6 +34,7 @@ LOG_FILE    = BOT_DIR / "live_trader.log"
 STATE_FILE  = BOT_DIR / "trader_state.json"
 TRADES_FILE = BOT_DIR / "trades_log.csv"
 PARAMS_FILE = BOT_DIR / "best_params.json"
+JOURNAL_DB  = BOT_DIR / "journal.db"
 
 _INT_PARAMS = {"BB_PERIOD", "RSI_PERIOD", "RSI_LONG_ENTRY", "RSI_SHORT_ENTRY",
                "RSI_LONG_EXIT", "RSI_SHORT_EXIT", "EMA_TREND1", "EMA_TREND2"}
@@ -162,6 +163,90 @@ def get_trades(_: str = Depends(authenticate)):
         return []
 
 
+@app.get("/api/llm")
+def get_llm(_: str = Depends(authenticate)):
+    """Last 50 LLM decisions + aggregates. Read-only sqlite, handles missing file."""
+    if not JOURNAL_DB.exists():
+        return {"decisions": [], "aggregates": _empty_llm_aggregates()}
+
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{JOURNAL_DB}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return {"decisions": [], "aggregates": _empty_llm_aggregates()}
+
+    try:
+        rows = conn.execute(
+            """SELECT d.id, d.timestamp, d.action, d.confidence,
+                      d.size_multiplier, d.reasoning, d.executed,
+                      d.lessons_applied_json,
+                      o.pnl_usd, o.exit_reason
+               FROM decisions d
+               LEFT JOIN outcomes o ON o.decision_id = d.id
+               ORDER BY d.id DESC LIMIT 50"""
+        ).fetchall()
+        decisions = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["lessons_applied"] = json.loads(d.pop("lessons_applied_json", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                d["lessons_applied"] = []
+            decisions.append(d)
+
+        # Aggregates
+        agg = conn.execute(
+            """SELECT
+                 COUNT(*) as total,
+                 SUM(CASE WHEN action='hold' THEN 1 ELSE 0 END) as holds,
+                 COALESCE(AVG(confidence), 0) as avg_confidence,
+                 COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                 COALESCE(SUM(completion_tokens), 0) as completion_tokens
+               FROM decisions"""
+        ).fetchone()
+
+        total = agg["total"]
+        pt = agg["prompt_tokens"] or 0
+        ct = agg["completion_tokens"] or 0
+        cost = pt * 0.14 / 1e6 + ct * 0.28 / 1e6
+
+        aggregates = {
+            "total_decisions": total,
+            "hold_pct": round((agg["holds"] / total * 100) if total else 0, 1),
+            "avg_confidence": round(agg["avg_confidence"], 3),
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "estimated_cost_usd": round(cost, 4),
+        }
+        return {"decisions": decisions, "aggregates": aggregates}
+    except Exception:
+        return {"decisions": [], "aggregates": _empty_llm_aggregates()}
+    finally:
+        conn.close()
+
+
+@app.get("/api/compare")
+def get_compare(_: str = Depends(authenticate)):
+    """LLM vs rule bot vs buy-and-hold comparison. Read-only."""
+    try:
+        from compare import get_comparison_data
+        return get_comparison_data(days=7)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _empty_llm_aggregates() -> dict:
+    return {
+        "total_decisions": 0,
+        "hold_pct": 0,
+        "avg_confidence": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "estimated_cost_usd": 0,
+    }
+
+
 @app.post("/api/bot/start")
 def bot_start(request: Request, _: str = Depends(authenticate)):
     """Start the bot. Defaults to testnet. Requires explicit mode=live for real money."""
@@ -245,7 +330,19 @@ button:hover{opacity:.85}
 .btn-start{border-color:var(--green);color:var(--green)}
 .btn-apply{border-color:var(--blue);color:var(--blue);background:#1f6feb22;width:100%;padding:8px;margin-top:8px;font-size:13px}
 .muted{color:var(--muted);font-size:11px}
-.main{display:grid;grid-template-columns:210px 1fr 270px;flex:1;overflow:hidden;min-height:0}
+.main{display:grid;grid-template-columns:210px 1fr 270px 300px;flex:1;overflow:hidden;min-height:0}
+.cmp-strip{background:var(--bg2);border-bottom:1px solid var(--border);padding:6px 16px;display:flex;align-items:center;gap:18px;flex-shrink:0;font-size:12px;overflow-x:auto}
+.cmp-strip h3{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-right:4px}
+.cmp-strip .tag{padding:2px 8px;border-radius:3px;font-size:11px}
+.tag-best{background:#3fb95022;color:var(--green);border:1px solid var(--green)}
+.tag-worse{background:#f8514922;color:var(--red);border:1px solid var(--red)}
+.tag-neutral{background:#d2992222;color:var(--yellow);border:1px solid var(--yellow)}
+.llm-card{background:var(--bg3);border-radius:4px;padding:9px;border-left:3px solid var(--border);display:flex;flex-direction:column;gap:3px}
+.llm-card.open_long{border-left-color:var(--blue)}
+.llm-card.open_short{border-left-color:var(--yellow)}
+.llm-card.close,.llm-card.hold{border-left-color:var(--muted)}
+.conf-bar{height:3px;background:var(--bg);border-radius:2px;overflow:hidden;margin-top:2px}
+.conf-fill{height:100%;background:var(--blue);transition:width .3s}
 .pane{border-right:1px solid var(--border);padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
 .pane:last-child{border-right:none}
 h2{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding-bottom:7px;border-bottom:1px solid var(--border);margin-bottom:2px;flex-shrink:0}
@@ -283,6 +380,11 @@ h2{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)
   <button id="tog" onclick="toggleBot()">—</button>
 </header>
 
+<div class="cmp-strip" id="cmp-strip">
+  <h3>Shadow Comparison</h3>
+  <span class="muted" id="cmp-status">Loading…</span>
+</div>
+
 <div class="main">
 
   <!-- STATUS -->
@@ -303,6 +405,12 @@ h2{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)
   <div class="pane">
     <h2>Recent Trades</h2>
     <div id="trades-body"><span class="muted">Loading…</span></div>
+  </div>
+
+  <!-- LLM SHADOW -->
+  <div class="pane">
+    <h2>LLM Shadow</h2>
+    <div id="llm-body"><span class="muted">Loading…</span></div>
   </div>
 
 </div>
@@ -476,13 +584,88 @@ async function toggleBot() {
   setTimeout(pollStatus, 1200);
 }
 
+// ── LLM Shadow ───────────────────────────────────────────────
+async function loadLLM() {
+  try {
+    const data = await fetch('/api/llm').then(r => r.json());
+    const el = document.getElementById('llm-body');
+    const ag = data.aggregates || {};
+    const decs = data.decisions || [];
+
+    if (!decs.length) {
+      el.innerHTML = '<span class="muted">No LLM decisions yet</span>';
+      return;
+    }
+
+    let html = `<div style="margin-bottom:6px;font-size:11px">
+      <span class="blue">${ag.total_decisions}</span> decisions
+      &middot; hold <span class="muted">${ag.hold_pct}%</span>
+      &middot; avg conf <span class="blue">${(ag.avg_confidence||0).toFixed(2)}</span>
+      &middot; ~$${(ag.estimated_cost_usd||0).toFixed(4)}
+    </div>`;
+
+    html += [...decs].slice(0, 25).map(d => {
+      const conf = (d.confidence || 0);
+      const lessons = (d.lessons_applied || []).join(', ');
+      const pnl = d.pnl_usd != null ? parseFloat(d.pnl_usd) : null;
+      const pnlStr = pnl != null ? ((pnl >= 0 ? '+' : '') + pnl.toFixed(4)) : '';
+      const pnlCls = pnl != null ? (pnl >= 0 ? 'green' : 'red') : '';
+      const ts = d.timestamp ? new Date(d.timestamp).toLocaleString() : '';
+      return `<div class="llm-card ${d.action}">
+        <div class="row">
+          <b class="${d.action==='open_long'?'blue':d.action==='open_short'?'yellow':'muted'}">${d.action.replace('_',' ')}</b>
+          <span class="muted">${ts}</span>
+        </div>
+        <div style="font-size:11px;color:var(--text)">${(d.reasoning||'').substring(0,120)}</div>
+        <div class="row" style="font-size:10px">
+          <span class="muted">conf ${conf.toFixed(2)}${pnlStr ? ' &middot; PnL ' : ''}${pnlStr ? '<span class="'+pnlCls+'">'+pnlStr+'</span>' : ''}</span>
+          <span class="muted">${d.executed ? 'exec' : 'shadow'}</span>
+        </div>
+        ${lessons ? '<div style="font-size:10px;color:var(--yellow)">Lessons: '+lessons+'</div>' : ''}
+        <div class="conf-bar"><div class="conf-fill" style="width:${(conf*100).toFixed(0)}%"></div></div>
+      </div>`;
+    }).join('');
+
+    el.innerHTML = html;
+  } catch(e) {}
+}
+
+// ── Comparison strip ──────────────────────────────────────────
+async function loadCompare() {
+  try {
+    const c = await fetch('/api/compare').then(r => r.json());
+    if (c.error) {
+      document.getElementById('cmp-status').textContent = c.error;
+      return;
+    }
+    const rule = c.rule || {}, llm = c.llm || {}, bah = c.buy_and_hold || {};
+    const best = (a, b) => {
+      if (a.total_pnl > b.total_pnl) return 'tag-best';
+      if (a.total_pnl < b.total_pnl) return 'tag-worse';
+      return 'tag-neutral';
+    };
+    document.getElementById('cmp-strip').innerHTML = `
+      <h3>Shadow (7d)</h3>
+      <span>Rule: <span class="${best(rule,llm)}">${(rule.total_pnl||0) >= 0?'+':''}${(rule.total_pnl||0).toFixed(4)}</span></span>
+      <span>LLM: <span class="${best(llm,rule)}">${(llm.total_pnl||0) >= 0?'+':''}${(llm.total_pnl||0).toFixed(4)}</span></span>
+      <span>B&H: <span class="muted">${(bah.pnl||0) >= 0?'+':''}${(bah.pnl||0).toFixed(4)}</span></span>
+      <span>Agreement: <span class="muted">${c.agreement_pct||0}%</span></span>
+      <span>Cost: <span class="muted">$${(c.estimated_cost_usd||0).toFixed(4)}</span></span>
+    `;
+  } catch(e) {}
+}
+
 // ── Init ─────────────────────────────────────────────────────
 pollStatus();
 loadConfig();
 loadTrades();
+loadLLM();
+loadCompare();
 startLogs();
 setInterval(pollStatus, 5000);
 setInterval(loadTrades, 30000);
+setInterval(loadLLM, 30000);
+setInterval(loadCompare, 60000);
 </script>
 </body>
 </html>"""
